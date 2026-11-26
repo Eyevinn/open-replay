@@ -1,0 +1,37 @@
+services:
+  couchdb:
+    image: couchdb:3
+    environment:
+      COUCHDB_USER: ${COUCHDB_USER:-admin}
+      COUCHDB_PASSWORD: ${COUCHDB_PASSWORD:?Set COUCHDB_PASSWORD in .env (see .env.example)}
+    ports:
+      - "127.0.0.1:${COUCHDB_PORT:-5984}:5984"
+    volumes:
+      - couchdb_data:/opt/couchdb/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:5984/_up"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      COUCHDB_URL: http://${COUCHDB_USER:-admin}:${COUCHDB_PASSWORD}@couchdb:5984
+      COUCHDB_NAME: open-replay
+      CORS_ORIGIN: http://localhost:5173
+      LOG_LEVEL: info
+      API_KEY: ${API_KEY:?Set API_KEY in .env (see .env.example)}
+      TAMS_GATEWAY_URL: ${TAMS_GATEWAY_URL:-}
+      OSC_ACCESS_TOKEN: ${OSC_ACCESS_TOKEN:-}
+      STROM_URL: ${STROM_URL:-}
+      STROM_AUTH_TOKEN: ${STROM_AUTH_TOKEN:-}
+    depends_on:
+      couchdb:
+        condition: service_healthy
+
+volumes:
+  couchdb_data:

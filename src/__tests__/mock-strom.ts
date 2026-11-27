@@ -3,12 +3,12 @@ import type { AddressInfo } from 'node:net';
 import { WebSocketServer, type WebSocket } from 'ws';
 
 /**
- * A stand-in for Strom's replay API with the clip queue that ADR-0002 plans: `cue {source}`, `cue_next`,
- * `item_started` / `ended` events with the item's `client_ref`, and a queue count in the state.
- *
- * It is written from the Strom author's description, not from Strom's code, because that code is not pushed yet.
- * Where the description is silent (state field names, whether `cue` clears the queue, what `uncue` does to it)
- * this mock chooses, and `replay-link.ts` is the one place to change when the real thing differs.
+ * A stand-in for Strom's replay API with the clip queue of ADR-0002: `cue {source}`, `cue_next`, `clear_queue`,
+ * `uncue`, the events `{type: "event", event: "item_started" | "ended" | "source_failed", client_ref}` and a state
+ * with `queue.clip_ref` and `queue.waiting`, as the Strom author described them on 2026-11-27 (branch
+ * `feat/open-replay-integration` at 15390f51). It is written from that description, not from Strom's code.
+ * Where it is silent (whether `cue` clears the queue, whether the cue is still held after the last item freezes) this
+ * mock chooses, and `replay-link.ts` is the one place to change when the real thing differs.
  *
  * Clip time runs at `timeScale` times real time, so a test can play minutes of clips in milliseconds.
  */
@@ -38,6 +38,12 @@ export interface MockOptions {
   timeScale?: number;
   /** Do not send `item_started` / `ended` over the WebSocket, as if they were lost. The state still tells the truth. */
   dropEvents?: boolean;
+  /** The replay API's `features`. */
+  features?: string[];
+  /** After the last item freezes the cue is still held (the default), or released. */
+  holdAtEnd?: boolean;
+  /** A source Strom cannot switch to: starting an item with it sends `source_failed` and stops the chain. */
+  failSource?: string;
 }
 
 const MS = 1_000_000n;
@@ -51,6 +57,9 @@ export class MockStrom {
   private readonly program = new Map<string, number>();
   dropEvents: boolean;
   private readonly timeScale: number;
+  private readonly features: string[];
+  private readonly holdAtEnd: boolean;
+  private readonly failSource: string | undefined;
   private readonly groups = new Map<string, Group>();
   private server?: Server;
   private wss?: WebSocketServer;
@@ -58,6 +67,9 @@ export class MockStrom {
   constructor(opts: MockOptions = {}) {
     this.timeScale = opts.timeScale ?? 0.02;
     this.dropEvents = opts.dropEvents ?? false;
+    this.features = opts.features ?? ['source_switch', 'cue_next'];
+    this.holdAtEnd = opts.holdAtEnd ?? true;
+    this.failSource = opts.failSource;
   }
 
   addGroup(flowId: string, name: string): void {
@@ -96,6 +108,12 @@ export class MockStrom {
     return null;
   }
 
+  /** Items waiting in a group's queue. */
+  waiting(group: string): number {
+    for (const g of this.groups.values()) if (g.name === group) return g.queue.length;
+    return 0;
+  }
+
   // ---- HTTP ----
 
   private find(path: string): Group | undefined {
@@ -109,6 +127,7 @@ export class MockStrom {
       res.writeHead(status, { 'content-type': 'application/json' });
       res.end(JSON.stringify(body));
     };
+    if (path === '/api/replay') return send(200, { api_version: 2, features: this.features, groups: [...this.groups.values()].map((g) => ({ flow_id: g.flowId, group: g.name })) });
     if (path === '/api/flows') {
       const flows = new Map<string, { id: string; gst_state: string; blocks: unknown[] }>();
       for (const g of this.groups.values()) {
@@ -153,8 +172,9 @@ export class MockStrom {
     return {
       ready: 'ready',
       time_domain: 'tai',
-      motion: { speed: g.playing ? g.current!.speed : 0, live: false, cue: g.current ? { client_ref: g.current.client_ref, in: g.current.in, out: g.current.out } : null },
-      queue: { current_ref: g.playing ? g.current!.client_ref : null, length: g.queue.length },
+      // `motion` is null until there is media; the cue is {in, out, end_action}.
+      motion: g.current ? { speed: g.playing ? g.current.speed : 0, live: false, cue: { in: g.current.in, out: g.current.out, end_action: g.current.end_action }, ramp: null } : null,
+      queue: { clip_ref: g.current?.client_ref ?? null, waiting: g.queue.length },
     };
   }
 
@@ -192,10 +212,15 @@ export class MockStrom {
         g.queue.push(it);
         return null;
       }
-      case 'uncue':
+      case 'clear_queue':
+        g.queue = [];
+        return null;
+      case 'pause':
+        this.halt(g);
+        return null;
+      case 'uncue': // drops the cue and keeps the queue, as Strom does today
         this.halt(g);
         g.current = null;
-        g.queue = [];
         return null;
       default:
         return { status: 400, error: 'invalid', message: `unknown cmd ${String(cmd['cmd'])}` };
@@ -211,6 +236,11 @@ export class MockStrom {
   /** Play the current item and, when it ends, the next one with no gap. */
   private start(g: Group): void {
     const it = g.current!;
+    if (this.failSource && it.source === this.failSource) {
+      g.playing = false;
+      this.emit(g, 'source_failed', it.client_ref);
+      return;
+    }
     g.playing = true;
     this.emit(g, 'item_started', it.client_ref);
     const clipMs = Number((BigInt(it.out) - BigInt(it.in)) / MS);
@@ -222,15 +252,15 @@ export class MockStrom {
         this.start(g);
       } else {
         g.playing = false; // freeze on the last frame: nothing plays, nothing is queued
-        g.current = null;
+        if (!this.holdAtEnd) g.current = null;
       }
     }, Math.max(1, (clipMs / it.speed) * this.timeScale));
   }
 
-  private emit(g: Group, type: 'item_started' | 'ended', ref: string): void {
-    this.happened.push(`${type}:${ref}`);
+  private emit(g: Group, event: 'item_started' | 'ended' | 'source_failed', ref: string): void {
+    this.happened.push(`${event}:${ref}`);
     if (this.dropEvents) return;
-    const msg = JSON.stringify({ type, event_seq: ++g.seq, cause: type === 'ended' ? 'cue_end' : 'cue_next', client_ref: ref });
+    const msg = JSON.stringify({ type: 'event', event_seq: ++g.seq, event, cause: event === 'ended' ? 'cue_end' : 'cue_end', client_ref: ref, ...(event === 'item_started' ? { waiting: g.queue.length } : {}) });
     for (const s of g.sockets) if (s.readyState === 1) s.send(msg);
   }
 }

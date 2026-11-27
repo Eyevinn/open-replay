@@ -78,7 +78,9 @@ export function buildReplayFlow(req: PlaybackRequest, tamsHost: string, encoderP
       id,
       block_definition_id: 'builtin.media_player',
       name: `Clip ${p.toUpperCase()}`,
-      properties: { mode: 'timeline', group: clipGroupOf(req.groupId, p), source: `tams+https://${tamsHost}/flows/${first.streamId}`, auth_mode: 'osc', output_framerate: '25/1', num_audio_tracks: 0 },
+      properties: { mode: 'timeline', group: clipGroupOf(req.groupId, p), source: `tams+https://${tamsHost}/flows/${first.streamId}`, auth_mode: 'osc', output_framerate: '25/1', num_audio_tracks: 0,
+        // A clip player is not live: with the default (true), forward play after an uncue or a seek out of the cue could pull its group to live. It starts paused.
+        follow_live: false },
       position: { x: 100, y: 80 + (n + k) * 160 },
     });
     links.push({ from: `${id}:video_out`, to: `${MIXER_BLOCK}:video_in_${clipInputOf(n, p)}` }, { from: `${id}:video_out`, to: `${PREVIEW_BLOCK}:video_in_${clipInputOf(n, p)}` });

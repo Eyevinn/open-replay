@@ -4,7 +4,7 @@ import type { DocumentScope } from 'nano';
 import { z } from 'zod';
 import { isNotFound, type Db } from '../db/index.js';
 import { PlaylistRunner, type EndAction, type RunnerItem, type RunnerStatus } from '../lib/playlist-runner.js';
-import { StromReplayLink } from '../lib/replay-link.js';
+import { readQueueFeatures, StromReplayLink } from '../lib/replay-link.js';
 import { clipGroupOf, type ClipPlayer } from '../lib/replay-flow.js';
 import type { StromClient } from '../lib/strom.js';
 import type { Services } from '../services.js';
@@ -61,11 +61,14 @@ export async function playlistPlayRoutes(app: FastifyInstance, opts: { db: Db; s
   };
 
   /** The flow of the group's replay and the name of its clip player's group, or why there is none. */
-  const clipPlayerOf = async (s: StromClient, groupId: string, player: string): Promise<Found> => {
+  const clipPlayerOf = async (s: StromClient, groupId: string, player: string, needQueue: boolean): Promise<Found> => {
     const group = clipGroupOf(groupId, player as ClipPlayer);
     try {
       const flow = flowOf(await listFlows(s), groupId);
       if (!flow) return { status: 409, error: 'This group has no running replay. Start it first.' };
+      // Strom says what it can do: switching a player's source in a cue, and queueing the next clip.
+      const can = await readQueueFeatures(s);
+      if (!can.sourceSwitch || (needQueue && !can.cueNext)) return { status: 409, error: `This Strom cannot ${needQueue ? 'queue clips' : 'switch a clip player\'s source'} yet: it does not report the ${can.sourceSwitch ? 'cue_next' : 'source_switch'} feature.` };
       const input = clipInputIn(flow, player as ClipPlayer);
       const there = input === null ? null : await s.request(`/api/replay/${flow.id}/${encodeURIComponent(group)}`);
       if (input === null || !there?.ok) return { status: 409, error: `This replay has no clip player ${player.toUpperCase()}. It was started before clip players existed: start it again.` };
@@ -112,7 +115,7 @@ export async function playlistPlayRoutes(app: FastifyInstance, opts: { db: Db; s
 
     const playlist = await getDoc(req.body.playlistId, 'playlist');
     if (!playlist) return reply.code(404).send({ error: 'No such playlist.' });
-    const found = await clipPlayerOf(strom, groupId, player);
+    const found = await clipPlayerOf(strom, groupId, player, true);
     if ('error' in found) return reply.code(found.status).send({ error: found.error });
 
     // The clips in order. One that was deleted since is left out, and the answer says so.
@@ -174,7 +177,7 @@ export async function playlistPlayRoutes(app: FastifyInstance, opts: { db: Db; s
     if (busy(groupId, player)) return reply.code(409).send({ error: `Clip player ${player.toUpperCase()} is playing a playlist. Stop it or use the other player.` });
     const clip = await getDoc(req.body.clipId, 'clip');
     if (!clip) return reply.code(404).send({ error: 'No such clip.' });
-    const found = await clipPlayerOf(strom, groupId, player);
+    const found = await clipPlayerOf(strom, groupId, player, false);
     if ('error' in found) return reply.code(found.status).send({ error: found.error });
 
     const streamId = req.body.streamId ?? String(clip['streamId']);
@@ -200,7 +203,7 @@ export async function playlistPlayRoutes(app: FastifyInstance, opts: { db: Db; s
     const { groupId } = req.params;
     const { player } = req.query;
     if (busy(groupId, player)) return reply.code(409).send({ error: `Clip player ${player.toUpperCase()} is playing a playlist. Stop that instead.` });
-    const found = await clipPlayerOf(strom, groupId, player);
+    const found = await clipPlayerOf(strom, groupId, player, false);
     if ('error' in found) return reply.code(found.status).send({ error: found.error });
     try {
       await new StromReplayLink(strom, found.flowId, found.group).stop();

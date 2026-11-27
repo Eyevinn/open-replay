@@ -5,10 +5,10 @@ import type { StromClient } from './strom.js';
 /**
  * A clip player of a Strom flow, over Strom's replay API: commands and state by REST, events by the group's WebSocket.
  *
- * The queue commands are the Strom author's description of work that is NOT yet in pushed code (ADR-0002):
- * `cue {source, in, out, end_action, client_ref}`, `cue_next` with the same fields plus `speed`, and
- * `item_started` / `ended` events with the item's `client_ref`. This file is the only place that knows those
- * names, and it reads the state tolerantly because the field names are a guess until Strom publishes them.
+ * The queue commands are Strom's (ADR-0002), as its author confirmed on 2026-11-27 for `feat/open-replay-integration`
+ * at 15390f51: `cue {source, in, out, end_action, client_ref}`, `cue_next` with the same fields plus `speed`, events
+ * `{type: "event", event: "item_started" | "ended" | "source_failed" | ..., client_ref, event_seq}`, and a state
+ * with `queue.clip_ref` and `queue.waiting`. This file is the only place that knows those names.
  */
 export class StromReplayLink implements ReplayLink {
   private readonly base: string;
@@ -43,8 +43,14 @@ export class StromReplayLink implements ReplayLink {
     return this.command({ cmd: 'cue_next', source: item.source, in: { t: item.in }, out: { t: item.out }, speed: item.speed, end_action: item.end_action, client_ref: item.client_ref });
   }
 
-  stop(): Promise<void> {
-    return this.command({ cmd: 'uncue' });
+  /**
+   * Stop where it is. `uncue` drops the cue but keeps the queue, and keeps the cursor and the speed too (Strom's
+   * REPLAY_API.md at 15390f51), so the queue goes first and the player is paused last: otherwise it plays on past the clip.
+   */
+  async stop(): Promise<void> {
+    await this.command({ cmd: 'clear_queue' });
+    await this.command({ cmd: 'uncue' });
+    await this.command({ cmd: 'pause' });
   }
 
   async state(): Promise<ClipPlayerState> {
@@ -87,14 +93,21 @@ const str = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? 
 const num = (v: unknown): number | null => (typeof v === 'number' ? v : null);
 const obj = (v: unknown): Record<string, unknown> | undefined => (v && typeof v === 'object' ? (v as Record<string, unknown>) : undefined);
 
-/** The state's own words for the current item and the queue. Names are a guess: `queue.current_ref` and `queue.length`, or the same at the top. */
+/** `queue.clip_ref` is the clip the group holds as its cue (else null), `queue.waiting` how many are queued behind it. `motion` is null until there is media. */
 export function readClipState(body: Record<string, unknown>): ClipPlayerState {
   const q = obj(body['queue']);
-  const cue = obj(obj(body['motion'])?.['cue']);
   return {
-    currentRef: str(q?.['current_ref']) ?? str(body['current_ref']) ?? str(cue?.['client_ref']),
-    queued: num(q?.['length']) ?? num(q?.['queued']) ?? num(body['queued']),
+    currentRef: str(q?.['clip_ref']),
+    queued: num(q?.['waiting']),
+    speed: num(obj(body['motion'])?.['speed']),
   };
+}
+
+/** Whether this Strom can switch a player's source in a cue (`source_switch`) and queue the next clip (`cue_next`): the replay API's `features`. */
+export async function readQueueFeatures(strom: StromClient): Promise<{ sourceSwitch: boolean; cueNext: boolean }> {
+  const r = await strom.request('/api/replay');
+  const features = Array.isArray(r.body['features']) ? (r.body['features'] as unknown[]) : [];
+  return { sourceSwitch: features.includes('source_switch'), cueNext: features.includes('cue_next') };
 }
 
 /** One WebSocket message as an event the runner understands, `'lagged'` when events were dropped, or null when it is not an event. */
@@ -105,8 +118,9 @@ export function readEvent(text: string): LinkEvent | 'lagged' | null {
   } catch {
     return null;
   }
-  const type = str(m['type']);
-  if (type === 'lagged') return 'lagged';
-  if (type === 'item_started' || type === 'ended') return { type, clientRef: str(m['client_ref']), seq: num(m['event_seq']) };
+  if (str(m['type']) === 'lagged') return 'lagged';
+  if (str(m['type']) !== 'event') return null;
+  const event = str(m['event']);
+  if (event === 'item_started' || event === 'ended' || event === 'source_failed') return { type: event, clientRef: str(m['client_ref']), seq: num(m['event_seq']) };
   return null;
 }

@@ -85,7 +85,10 @@ describe('playlist runner against the mock Strom', () => {
     const runner = new PlaylistRunner(link(), items, { pollMs: 0 });
     await runner.start();
     await runner.stop();
-    expect(mock.commands.at(-1)).toMatchObject({ cmd: 'uncue' });
+    // `uncue` alone keeps the queue and the speed: the queue is cleared first and the player paused last.
+    expect(mock.commands.slice(-3)).toMatchObject([{ cmd: 'clear_queue' }, { cmd: 'uncue' }, { cmd: 'pause' }]);
+    expect(mock.waiting(GROUP)).toBe(0);
+    expect(mock.playingRef(GROUP)).toBeNull();
     expect(runner.status().state).toBe('stopped');
     await new Promise((r) => setTimeout(r, 100));
     expect(runner.status().state).toBe('stopped');
@@ -117,18 +120,39 @@ describe('playlist runner when events are lost', () => {
   });
 });
 
-describe('what the link reads from Strom', () => {
-  it('reads the current item and the queue from the state, in either place', () => {
-    expect(readClipState({ queue: { current_ref: 'r-1', length: 2 } })).toEqual({ currentRef: 'r-1', queued: 2 });
-    expect(readClipState({ current_ref: 'r-2', queued: 0 })).toEqual({ currentRef: 'r-2', queued: 0 });
-    expect(readClipState({ motion: { cue: { client_ref: 'r-3' } } })).toEqual({ currentRef: 'r-3', queued: null });
-    expect(readClipState({})).toEqual({ currentRef: null, queued: null });
+describe('playlist runner against other behaviour of Strom', () => {
+  it('notices the end by reading the state when the player releases its cue at the end', async () => {
+    await setup({ dropEvents: true, holdAtEnd: false });
+    const runner = new PlaylistRunner(link(), items, { pollMs: 10 });
+    await runner.start();
+    await until(() => runner.status().state === 'finished');
   });
 
-  it('reads events, and a lagged message', () => {
-    expect(readEvent('{"type":"item_started","client_ref":"r-1","event_seq":4}')).toEqual({ type: 'item_started', clientRef: 'r-1', seq: 4 });
-    expect(readEvent('{"type":"ended","client_ref":"r-1"}')).toMatchObject({ type: 'ended' });
+  it('fails when Strom cannot switch to an item\'s source, and says which item', async () => {
+    await setup({ failSource: items[1]!.source });
+    const runner = new PlaylistRunner(link(), items, { pollMs: 0 });
+    await runner.start();
+    await until(() => runner.status().state === 'failed');
+    expect(runner.status().error).toMatch(/item 2 \(B\)/);
+  });
+});
+
+describe('what the link reads from Strom', () => {
+  it('reads the held clip, the number waiting and the speed from the state', () => {
+    expect(readClipState({ queue: { clip_ref: 'r-1', waiting: 2 }, motion: { speed: 0.5 } })).toEqual({ currentRef: 'r-1', queued: 2, speed: 0.5 });
+    expect(readClipState({ queue: { clip_ref: null, waiting: 0 }, motion: null })).toEqual({ currentRef: null, queued: 0, speed: null });
+    // The names it used to guess are gone: they do not exist.
+    expect(readClipState({ queue: { current_ref: 'r-2', length: 3 }, current_ref: 'r-2' })).toEqual({ currentRef: null, queued: null, speed: null });
+  });
+
+  it('reads events by their name, and a lagged message', () => {
+    expect(readEvent('{"type":"event","event_seq":42,"event":"item_started","cause":"cue_end","client_ref":"clip-18","waiting":0}')).toEqual({ type: 'item_started', clientRef: 'clip-18', seq: 42 });
+    expect(readEvent('{"type":"event","event_seq":41,"event":"ended","cause":"cue_end","client_ref":"clip-17"}')).toMatchObject({ type: 'ended', clientRef: 'clip-17' });
+    expect(readEvent('{"type":"event","event":"source_failed","client_ref":"clip-19"}')).toMatchObject({ type: 'source_failed' });
+    expect(readEvent('{"type":"event","event":"ended"}')).toMatchObject({ clientRef: null }); // no client_ref when none was given
+    expect(readEvent('{"type":"event","event":"source_changed","client_ref":"x"}')).toBeNull();
     expect(readEvent('{"type":"lagged"}')).toBe('lagged');
+    expect(readEvent('{"type":"ended","client_ref":"r-1"}')).toBeNull(); // the old shape
     expect(readEvent('{"type":"state"}')).toBeNull();
     expect(readEvent('not json')).toBeNull();
   });

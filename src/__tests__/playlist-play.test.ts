@@ -52,8 +52,8 @@ const url = (p: string) => `/api/v1/groups/g1/playback/playlist${p}`;
 type Reply = { statusCode: number; json: () => Record<string, any> };
 const post = async (path: string, payload: object): Promise<Reply> => (await app.inject({ method: 'POST', url: `/api/v1${path}`, payload })) as unknown as Reply;
 
-async function setup(withClipPlayer: boolean) {
-  mock = new MockStrom({ timeScale: 0.02 });
+async function setup(withClipPlayer: boolean, features?: string[]) {
+  mock = new MockStrom({ timeScale: 0.02, ...(features ? { features } : {}) });
   mock.addGroup('f1', 'studio-g1');
   if (withClipPlayer) {
     mock.addGroup('f1', 'studio-g1-a');
@@ -153,7 +153,7 @@ describe('cueing one clip', () => {
     const { a, playlist } = await library();
     await app.inject({ method: 'PUT', url: clipUrl(), payload: { clipId: a } });
     expect((await app.inject({ method: 'DELETE', url: clipUrl() })).json()).toEqual({ cleared: true });
-    expect(mock.commands.at(-1)).toMatchObject({ cmd: 'uncue' });
+    expect(mock.commands.slice(-3).map((c) => c['cmd'])).toEqual(['clear_queue', 'uncue', 'pause']);
     await app.inject({ method: 'PUT', url: url(''), payload: { playlistId: playlist } });
     const busy = await app.inject({ method: 'PUT', url: clipUrl('?player=a'), payload: { clipId: a } });
     expect(busy.statusCode).toBe(409);
@@ -169,6 +169,27 @@ describe('cueing one clip', () => {
 
   it('answers 404 for a clip that does not exist', async () => {
     expect((await app.inject({ method: 'PUT', url: clipUrl(), payload: { clipId: 'clip:nope' } })).statusCode).toBe(404);
+  });
+});
+
+describe("a Strom that cannot switch a clip player's source or queue clips yet", () => {
+  it('says which feature is missing instead of sending a command it would refuse', async () => {
+    await setup(true, []);
+    const { a, playlist } = await library();
+    const pl = await app.inject({ method: 'PUT', url: url(''), payload: { playlistId: playlist } });
+    expect(pl.statusCode).toBe(409);
+    expect(pl.json().error).toMatch(/cannot queue clips.*source_switch/);
+    const clip = await app.inject({ method: 'PUT', url: '/api/v1/groups/g1/playback/clip', payload: { clipId: a } });
+    expect(clip.statusCode).toBe(409);
+    expect(clip.json().error).toMatch(/cannot switch a clip player's source.*source_switch/);
+    expect(mock.commands).toEqual([]);
+    await mock.close();
+    await setup(true, ['source_switch']); // can switch a source but not queue
+    const lib = await library();
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/groups/g1/playback/clip', payload: { clipId: lib.a } })).statusCode).toBe(200);
+    const queue = await app.inject({ method: 'PUT', url: url(''), payload: { playlistId: lib.playlist } });
+    expect(queue.statusCode).toBe(409);
+    expect(queue.json().error).toMatch(/cannot queue clips.*cue_next/);
   });
 });
 

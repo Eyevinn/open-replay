@@ -27,9 +27,11 @@ export interface ClipPlayerState {
   currentRef: string | null;
   /** How many items wait behind the current one. */
   queued: number | null;
+  /** The playing speed; 0 when held or frozen. `null` before there is media. */
+  speed: number | null;
 }
 
-export type LinkEvent = { type: 'item_started' | 'ended' | 'other'; clientRef: string | null; seq: number | null };
+export type LinkEvent = { type: 'item_started' | 'ended' | 'source_failed'; clientRef: string | null; seq: number | null };
 
 /** The runner's view of one clip player. */
 export interface ReplayLink {
@@ -39,7 +41,7 @@ export interface ReplayLink {
   play(speed: number): Promise<void>;
   /** Add an item behind the current one. */
   queue(item: QueueItem): Promise<void>;
-  /** Drop the cue and the queue. */
+  /** Stop where it is: drop the queue and the cue. */
   stop(): Promise<void>;
   state(): Promise<ClipPlayerState>;
   /** Events as they come; `onResync` is called when some may have been missed (a reconnect, or Strom saying so). Returns an unsubscribe. */
@@ -97,6 +99,8 @@ export class PlaylistRunner {
   private state: RunnerState = 'running';
   private error?: string;
   private busy: Promise<unknown> = Promise.resolve();
+  /** Polls in a row that saw the last item frozen with nothing behind it. */
+  private idlePolls = 0;
 
   constructor(
     private readonly link: ReplayLink,
@@ -190,7 +194,9 @@ export class PlaylistRunner {
     if (this.state !== 'running') return;
     const n = this.parse(e.clientRef);
     if (n === null) return;
-    if (e.type === 'item_started') {
+    if (e.type === 'source_failed') {
+      this.fail(new Error(`Strom could not switch to the source of item ${(n % this.items.length) + 1} (${this.items[n % this.items.length]!.name}).`));
+    } else if (e.type === 'item_started') {
       this.started(n);
     } else if (e.type === 'ended' && n === this.items.length - 1 && this.endAction !== 'loop' && n >= this.startedN) {
       this.finish();
@@ -215,8 +221,12 @@ export class PlaylistRunner {
     const n = this.parse(s.currentRef);
     if (n !== null && n > this.startedN) this.started(n);
     else void this.fill();
-    // Nothing playing and nothing queued after the last item was sent: it ended and the event was missed.
-    if (s.currentRef === null && s.queued === 0 && this.sent >= this.total() && this.startedN >= this.items.length - 1) this.finish();
+    // The last item sent, nothing behind it, and the player not moving, twice in a row: it ended and the event was missed.
+    // (A held cue may still name the last item, or the player may hold none; either way it is idle.)
+    const last = this.items.length - 1;
+    const idle = s.queued === 0 && (s.speed === 0 || s.speed === null) && (s.currentRef === null || this.parse(s.currentRef) === last);
+    this.idlePolls = idle && this.sent >= this.total() && this.startedN >= last ? this.idlePolls + 1 : 0;
+    if (this.idlePolls >= 2) this.finish();
   }
 
   private finish(): void {

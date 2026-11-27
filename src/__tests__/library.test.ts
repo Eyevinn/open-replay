@@ -172,7 +172,7 @@ describe('records saved in the first shape', () => {
     await put({ ...base, _id: 'clip:b', createdAt: '2026-01-02T00:00:00Z', updatedAt: 'x', tag: 'goal' });
     await put({ ...base, _id: 'clip:a', createdAt: '2026-01-01T00:00:00Z', updatedAt: 'x', tag: null });
     await put({ type: 'mark', _id: 'mark:m', groupId: 'g1', name: 'Offside', t: '5', tag: 'foul', createdAt: '2026-01-01T00:00:00Z', updatedAt: 'x' });
-    expect(await migrateLibrary(db.docs)).toEqual({ marks: 1, clips: 2 });
+    expect(await migrateLibrary(db.docs)).toEqual({ marks: 1, clips: 2, playlists: 0 });
     const app = await buildServer({ apiKey: undefined, corsOrigin: undefined, logLevel: 'silent' }, db);
     const a = (await app.inject('/api/v1/clips/clip:a')).json();
     const b = (await app.inject('/api/v1/clips/clip:b')).json();
@@ -180,7 +180,26 @@ describe('records saved in the first shape', () => {
     expect(b).not.toHaveProperty('speed');
     expect((await app.inject('/api/v1/marks/mark:m')).json()).not.toHaveProperty('name');
     expect((await app.inject({ method: 'POST', url: '/api/v1/clips', payload: clipBody })).json().number).toBe(3);
-    expect(await migrateLibrary(db.docs)).toEqual({ marks: 0, clips: 0 });
+    expect(await migrateLibrary(db.docs)).toEqual({ marks: 0, clips: 0, playlists: 0 });
+  });
+});
+
+describe('playlists saved in the old shape', () => {
+  it('get the group of their first clip, autoPlay off and default tracks; one with no clip is dropped', async () => {
+    const db = fakeDb();
+    const put = (d: Record<string, unknown>) => db.docs.insert(d as never);
+    const t = { createdAt: '2026-01-01T00:00:00Z', updatedAt: 'x' };
+    await put({ type: 'clip', _id: 'clip:a', groupId: 'g7', name: 'c', streamId: 'cam-1', inT: '1', outT: '2', number: 1, tags: [], ...t });
+    await put({ type: 'playlist', _id: 'playlist:old', name: 'Old', endAction: 'loop', items: [{ clipId: 'clip:gone', speed: 1 }, { clipId: 'clip:a', speed: 0.5 }], ...t });
+    await put({ type: 'playlist', _id: 'playlist:empty', name: 'Empty', endAction: 'freeze', items: [], ...t });
+    expect(await migrateLibrary(db.docs)).toEqual({ marks: 0, clips: 0, playlists: 2 });
+    const app = await buildServer({ apiKey: undefined, corsOrigin: undefined, logLevel: 'silent' }, db);
+    expect((await app.inject('/api/v1/playlists/playlist:old')).json()).toMatchObject({
+      groupId: 'g7', autoPlay: false, endAction: 'loop',
+      items: [{ clipId: 'clip:gone', speed: 1, audioTracks: [true, true, false, false] }, { clipId: 'clip:a', speed: 0.5, audioTracks: [true, true, false, false] }],
+    });
+    expect((await app.inject('/api/v1/playlists/playlist:empty')).statusCode).toBe(404);
+    expect(await migrateLibrary(db.docs)).toEqual({ marks: 0, clips: 0, playlists: 0 });
   });
 });
 
@@ -201,18 +220,55 @@ describe('playlists', () => {
     const app = await make();
     const a = (await app.inject({ method: 'POST', url: '/api/v1/clips', payload: clipBody })).json();
     const b = (await app.inject({ method: 'POST', url: '/api/v1/clips', payload: { ...clipBody, name: 'Save' } })).json();
-    const ok = await app.inject({ method: 'POST', url: '/api/v1/playlists', payload: { name: 'Highlights', items: [{ clipId: b.id }, { clipId: a.id, speed: 0.5 }] } });
+    const ok = await app.inject({ method: 'POST', url: '/api/v1/playlists', payload: { groupId: 'g1', name: 'Highlights', items: [{ clipId: b.id }, { clipId: a.id, speed: 0.5 }] } });
     expect(ok.statusCode).toBe(201);
-    expect(ok.json().items).toEqual([{ clipId: b.id, speed: 1 }, { clipId: a.id, speed: 0.5 }]);
-    const missing = await app.inject({ method: 'POST', url: '/api/v1/playlists', payload: { name: 'Bad', items: [{ clipId: 'clip:nope' }] } });
+    expect(ok.json().items).toEqual([
+      { clipId: b.id, speed: 1, audioTracks: [true, true, false, false] },
+      { clipId: a.id, speed: 0.5, audioTracks: [true, true, false, false] },
+    ]);
+    expect(ok.json()).toMatchObject({ groupId: 'g1', autoPlay: false, endAction: 'freeze' });
+    const missing = await app.inject({ method: 'POST', url: '/api/v1/playlists', payload: { groupId: 'g1', name: 'Bad', items: [{ clipId: 'clip:nope' }] } });
     expect(missing.statusCode).toBe(400);
+  });
+
+  it('keeps a camera and the track switches per entry, and refuses a playlist without a group or a bad speed', async () => {
+    const app = await make();
+    const a = (await app.inject({ method: 'POST', url: '/api/v1/clips', payload: clipBody })).json();
+    const items = [{ clipId: a.id, streamId: 'cam-2', speed: 0.25, audioTracks: [false, false, true, true] }, { clipId: a.id }];
+    const res = await app.inject({ method: 'POST', url: '/api/v1/playlists', payload: { groupId: 'g1', name: 'P', autoPlay: true, endAction: 'loop', items } });
+    expect(res.statusCode).toBe(201);
+    expect(res.json()).toMatchObject({ autoPlay: true, endAction: 'loop' });
+    expect(res.json().items[0]).toEqual(items[0]);
+    expect(res.json().items[1]).toEqual({ clipId: a.id, speed: 1, audioTracks: [true, true, false, false] }); // no streamId: the clip's camera
+    const post = (payload: object) => app.inject({ method: 'POST', url: '/api/v1/playlists', payload });
+    expect((await post({ name: 'No group' })).statusCode).toBe(400);
+    for (const speed of [0, 1.5]) expect((await post({ groupId: 'g1', name: 'x', items: [{ clipId: a.id, speed }] })).statusCode).toBe(400);
+    expect((await post({ groupId: 'g1', name: 'x', items: [{ clipId: a.id, audioTracks: [true] }] })).statusCode).toBe(400);
+    const patched = await app.inject({ method: 'PATCH', url: `/api/v1/playlists/${res.json().id}`, payload: { groupId: 'g9', autoPlay: false } });
+    expect(patched.json()).toMatchObject({ groupId: 'g1', autoPlay: false });
+  });
+
+  it('copies a playlist under a new name, in the same group, with the same entries', async () => {
+    const app = await make();
+    const a = (await app.inject({ method: 'POST', url: '/api/v1/clips', payload: clipBody })).json();
+    const items = [{ clipId: a.id, streamId: 'cam-2', speed: 0.5, audioTracks: [true, false, true, false] }];
+    const pl = (await app.inject({ method: 'POST', url: '/api/v1/playlists', payload: { groupId: 'g1', name: 'Original', endAction: 'live', items } })).json();
+    const res = await app.inject({ method: 'POST', url: `/api/v1/playlists/${pl.id}/copy`, payload: { name: 'Copy' } });
+    expect(res.statusCode).toBe(201);
+    const copy = res.json();
+    expect(copy.id).not.toBe(pl.id);
+    expect(copy).toMatchObject({ name: 'Copy', groupId: 'g1', endAction: 'live', items });
+    await app.inject({ method: 'PATCH', url: `/api/v1/playlists/${copy.id}`, payload: { items: [] } });
+    expect((await app.inject(`/api/v1/playlists/${pl.id}`)).json()).toMatchObject({ name: 'Original', items });
+    expect((await app.inject({ method: 'POST', url: '/api/v1/playlists/playlist:nope/copy', payload: { name: 'x' } })).statusCode).toBe(404);
+    expect((await app.inject({ method: 'POST', url: `/api/v1/playlists/${a.id}/copy`, payload: { name: 'x' } })).statusCode).toBe(404);
   });
 
   it('reorders by patching the items', async () => {
     const app = await make();
     const a = (await app.inject({ method: 'POST', url: '/api/v1/clips', payload: clipBody })).json();
     const b = (await app.inject({ method: 'POST', url: '/api/v1/clips', payload: clipBody })).json();
-    const pl = (await app.inject({ method: 'POST', url: '/api/v1/playlists', payload: { name: 'P', items: [{ clipId: a.id }, { clipId: b.id }] } })).json();
+    const pl = (await app.inject({ method: 'POST', url: '/api/v1/playlists', payload: { groupId: 'g1', name: 'P', items: [{ clipId: a.id }, { clipId: b.id }] } })).json();
     const res = await app.inject({ method: 'PATCH', url: `/api/v1/playlists/${pl.id}`, payload: { items: [{ clipId: b.id }, { clipId: a.id }] } });
     expect(res.json().items.map((i: { clipId: string }) => i.clipId)).toEqual([b.id, a.id]);
   });
@@ -221,7 +277,7 @@ describe('playlists', () => {
     const app = await make();
     const a = (await app.inject({ method: 'POST', url: '/api/v1/clips', payload: clipBody })).json();
     const b = (await app.inject({ method: 'POST', url: '/api/v1/clips', payload: clipBody })).json();
-    const pl = (await app.inject({ method: 'POST', url: '/api/v1/playlists', payload: { name: 'P', items: [{ clipId: a.id }, { clipId: b.id }] } })).json();
+    const pl = (await app.inject({ method: 'POST', url: '/api/v1/playlists', payload: { groupId: 'g1', name: 'P', items: [{ clipId: a.id }, { clipId: b.id }] } })).json();
     await app.inject({ method: 'DELETE', url: `/api/v1/clips/${a.id}` });
     const after = (await app.inject(`/api/v1/playlists/${pl.id}`)).json();
     expect(after.items.map((i: { clipId: string }) => i.clipId)).toEqual([b.id]);

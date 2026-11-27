@@ -6,7 +6,7 @@ import { z } from 'zod';
 import { isConflict, isNotFound, type Db } from '../db/index.js';
 import {
   clipInput, clipPatch, clipSchema, counterId, tagListId, tagNameSchema, tagSchema, markInput, markPatch, markSchema,
-  playlistInput, playlistPatch, playlistSchema,
+  playlistCopyInput, playlistInput, playlistPatch, playlistSchema,
   type LibraryDoc, type LibraryKind,
 } from '../db/library-types.js';
 
@@ -211,6 +211,25 @@ export async function libraryRoutes(app: FastifyInstance, opts: { db: Db }) {
     }
     await retagClips(groupId, name, null);
     return reply.code(204).send(null);
+  });
+
+  /** "Save as": a new playlist in the same group with the same entries. */
+  r.post('/playlists/:id/copy', {
+    schema: { tags: ['library'], params: idParams, body: playlistCopyInput, response: { 201: playlistSchema, 404: error } },
+  }, async (req, reply) => {
+    let cur: Doc;
+    try {
+      cur = await docs.get(req.params.id);
+    } catch (err) {
+      if (isNotFound(err)) return reply.code(404).send({ error: 'not found' });
+      throw err;
+    }
+    if (cur.type !== 'playlist') return reply.code(404).send({ error: 'not found' });
+    const now = new Date().toISOString();
+    const { _rev: _r, ...rest } = cur;
+    const doc = { ...rest, name: req.body.name, items: structuredClone(cur['items'] ?? []), _id: `playlist:${randomUUID()}`, createdAt: now, updatedAt: now } as unknown as Doc;
+    const saved = await docs.insert(doc);
+    return reply.code(201).send(toApi({ ...doc, _rev: saved.rev }) as never);
   });
 
   const bad = (reply: FastifyReply, message: string) => reply.code(400).send({ error: message });

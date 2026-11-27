@@ -20,8 +20,8 @@ pnpm dev                  # http://localhost:3000, OpenAPI UI at /docs
 
 - `GET /health`, `GET /ready` (ready checks CouchDB)
 - `GET /api/v1/streams`: the recorded streams in the TAMS store (every flow with segments, its tags and extent).
-- `GET|PUT|DELETE /api/v1/groups/:groupId/playback`: whether the group's replay runs on Strom, start it (body: `name`, `srtUri`, `members`), stop it. The program goes out over SRT to `srtUri`.
-- `PUT /api/v1/groups/:groupId/playback/preview` (body `{source}`) puts a source in preview, including the one on air (the preview mixer can show any source); `POST .../playback/take` cuts the preview to program. Status lists each source with its own WHEP video, one preview video that follows whatever is in preview (a second, preview-only mixer inside the replay flow, so changing the preview opens no new connection), and which source is on air and in preview.
+- `GET|PUT|DELETE /api/v1/groups/:groupId/playback`: whether the group's replay runs on Strom, start it (body: `name`, `srtUri`, `members`), stop it. The program goes out over SRT to `srtUri` and as WHEP video for the browser (`programPath` in the status). A flow started before the program WHEP existed is reported `outdated`.
+- `PUT /api/v1/groups/:groupId/playback/preview` (body `{source}`) puts a source in preview, including the one on air (the preview mixer can show any source); `POST .../playback/take` cuts the preview to program. Status lists the program's WHEP path, each source with its own WHEP video, one preview video that follows whatever is in preview (a second, preview-only mixer inside the replay flow, so changing the preview opens no new connection), and which source is on air and in preview.
 - `/api/v1/strom/*`: Strom for the browser (REST, the replay WebSocket, WHEP video), with the Strom key added here.
 - `/api/v1/replays`: `GET` list, `POST`, `GET|PATCH|DELETE /:id`. Auth with `X-API-Key` or `Authorization: Bearer`.
 

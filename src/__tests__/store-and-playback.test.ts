@@ -32,13 +32,21 @@ describe('buildReplayFlow', () => {
     expect(ids).toContain('whep_cam1');
     expect(ids).toContain('whep_cam2');
     expect(ids).not.toContain('whep_mv');
-    expect(ids).not.toContain('whep_pgm');
-    expect(ids).not.toContain('enc_pgm');
     expect(flow.links.some((l) => l.from.endsWith('multiview_out'))).toBe(false);
   });
   it('has one preview video that a preview mixer feeds from every source', () => {
     expect(flow.blocks.map((b) => b['id'])).toEqual(expect.arrayContaining(['pvw', 'enc_pvw', 'whep_pvw']));
     expect(flow.links).toEqual(expect.arrayContaining([{ from: 'cam1:video_out', to: 'pvw:video_in_0' }, { from: 'cam2:video_out', to: 'pvw:video_in_1' }, { from: 'pvw:pgm_out', to: 'enc_pvw:video_in' }]));
+  });
+  it('has a program WHEP video fed by the program bus, next to the unchanged SRT output', () => {
+    const whep = flow.blocks.find((b) => b['id'] === 'whep_pgm')!;
+    expect(whep['block_definition_id']).toBe('builtin.whep_output');
+    expect((whep['properties'] as Record<string, unknown>)['endpoint_id']).toBe(endpointOf('g-5696da24', 'pgm'));
+    expect(endpointOf('g-5696da24', 'pgm')).not.toBe(endpointOf('g-5696da24', 'pvw'));
+    expect(flow.links).toEqual(expect.arrayContaining([
+      { from: 'vm:pgm_out', to: 'enc_pgm:video_in' }, { from: 'enc_pgm:encoded_out', to: 'whep_pgm:video_in' },
+      { from: 'vm:pgm_out', to: 'q_air:sink' }, { from: 'enc_air:encoded_out', to: 'srt_air:video_in' },
+    ]));
   });
   it('lets Strom pick hardware encoders when it has them', () => {
     const encoders = flow.blocks.filter((b) => b['block_definition_id'] === 'builtin.videoenc');
@@ -106,6 +114,36 @@ describe('a replay that has source videos but no preview mixer', () => {
     } finally {
       globalThis.fetch = real;
     }
+  });
+});
+
+describe('the program WHEP video in the status', () => {
+  const blocks = (extra: object[]) => [
+    { id: 'cam1', block_definition_id: 'builtin.media_player', name: 'A', properties: { group: 'studio-g-1' } },
+    { id: 'whep_cam1', block_definition_id: 'builtin.whep_output', properties: {} },
+    { id: 'pvw', block_definition_id: 'builtin.vision_mixer', properties: {} },
+    { id: 'whep_pvw', block_definition_id: 'builtin.whep_output', properties: {} },
+    ...extra,
+  ];
+  const status = async (b: object[]) => {
+    const flows = { flows: [{ id: 'f1', blocks: b }] };
+    const real = globalThis.fetch;
+    globalThis.fetch = (async (url: string) => new Response(JSON.stringify(String(url).endsWith('/state') ? { program_input: 0, preview_input: 1 } : flows), { status: 200 })) as unknown as typeof fetch;
+    try {
+      const app = await buildServer(base, db, { strom: new StromClient({ url: 'http://strom.test', key: undefined }) });
+      return (await app.inject('/api/v1/groups/g-1/playback')).json();
+    } finally {
+      globalThis.fetch = real;
+    }
+  };
+  it('returns the program path through the Strom proxy for a current flow', async () => {
+    const body = await status(blocks([{ id: 'whep_pgm', block_definition_id: 'builtin.whep_output', properties: {} }]));
+    expect(body.programPath).toBe(`/api/v1/strom/whep/${endpointOf('g-1', 'pgm')}`);
+    expect(body.outdated).toBe(false);
+  });
+  it('reports a flow from before the program WHEP as outdated', async () => {
+    const body = await status(blocks([]));
+    expect(body.outdated).toBe(true);
   });
 });
 

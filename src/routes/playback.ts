@@ -39,12 +39,14 @@ const playbackSchema = z.discriminatedUnion('running', [
     stromPath: z.string(),
     /** The preview as WHEP video: one connection that follows whichever source is in preview. */
     previewPath: z.string(),
+    /** The program as WHEP video: the same picture as the SRT output. */
+    programPath: z.string(),
     /** Each source with its own WHEP video, in mixer input order. */
     sources: z.array(z.object({ index: z.number().int(), label: z.string(), path: z.string() })),
     mixer: mixerSchema,
     /** The SRT address the program goes to. */
     srtUri: z.string().nullable(),
-    /** True for a replay started before sources had their own video: it has to be started again to be driven here. */
+    /** True for a replay started before it had source, preview and program video: it has to be started again to be driven here. */
     outdated: z.boolean(),
   }),
 ]);
@@ -104,6 +106,7 @@ async function describe(strom: StromClient, flow: StromFlow | undefined, groupId
   const hasVideo = (i: number) => blocks.some((b) => b.id === `whep_cam${i + 1}`);
   const sources = players.flatMap((b, i) => (hasVideo(i) ? [{ index: i, label: b.name ?? `Source ${i + 1}`, path: `${STROM_PROXY_PREFIX}/whep/${endpointOf(groupId, `cam${i + 1}`)}` }] : []));
   const hasPreview = blocks.some((b) => b.id === 'whep_pvw');
+  const hasProgram = blocks.some((b) => b.id === 'whep_pgm');
   const srt = blocks.find((b) => b.block_definition_id === 'builtin.mpegtssrt_output')?.properties?.['srt_uri'];
   return {
     running: true,
@@ -112,10 +115,11 @@ async function describe(strom: StromClient, flow: StromFlow | undefined, groupId
     group: replayGroupOf(groupId),
     stromPath: STROM_PROXY_PREFIX,
     previewPath: `${STROM_PROXY_PREFIX}/whep/${endpointOf(groupId, 'pvw')}`,
+    programPath: `${STROM_PROXY_PREFIX}/whep/${endpointOf(groupId, 'pgm')}`,
     sources,
     mixer,
     srtUri: typeof srt === 'string' ? srt : null,
-    outdated: players.length > 0 && (sources.length === 0 || !hasPreview),
+    outdated: players.length > 0 && (sources.length === 0 || !hasPreview || !hasProgram),
   };
 }
 

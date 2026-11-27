@@ -26,12 +26,12 @@ export const MIXER_BLOCK = 'vm';
  */
 export const PREVIEW_BLOCK = 'pvw';
 
-/** The WHEP endpoint of the preview, or of one source (`cam1`, `cam2`, ...). The program has none: it goes out over SRT. */
-export const endpointOf = (groupId: string, kind: 'pvw' | `cam${number}`) => `or-${groupId.replace(/[^a-z0-9]/gi, '').slice(-10)}-${kind}`;
+/** The WHEP endpoint of the program (`pgm`), of the preview, or of one source (`cam1`, `cam2`, ...). */
+export const endpointOf = (groupId: string, kind: 'pgm' | 'pvw' | `cam${number}`) => `or-${groupId.replace(/[^a-z0-9]/gi, '').slice(-10)}-${kind}`;
 
 /**
  * The Strom flow that replays one group: a media player per stream, each with its own WHEP video; a mixer with a
- * preview and a program bus; the program goes out over SRT only. `encoderPreference` is passed to every encoder.
+ * preview and a program bus; the program goes out over SRT and as WHEP video for the browser. `encoderPreference` is passed to every encoder.
  */
 export type EncoderPreference = 'auto' | 'hardware' | 'software';
 
@@ -63,6 +63,8 @@ export function buildReplayFlow(req: PlaybackRequest, tamsHost: string, encoderP
     { id: PREVIEW_BLOCK, block_definition_id: 'builtin.vision_mixer', name: 'Preview mixer', properties: { num_inputs: req.members.length, pgm_framerate: '25/1', pgm_resolution: '1280x720', initial_pgm_input: Math.min(1, req.members.length - 1), ...labels }, position: { x: 400, y: 320 } },
     { id: 'enc_pvw', block_definition_id: 'builtin.videoenc', name: 'Enc preview', properties: { encoder_preference: encoderPreference, bitrate: 3000 }, position: { x: 700, y: 340 } },
     { id: 'whep_pvw', block_definition_id: 'builtin.whep_output', name: 'Preview WHEP', properties: { num_audio_tracks: 0, endpoint_id: endpointOf(req.groupId, 'pvw') }, position: { x: 950, y: 340 } },
+    { id: 'enc_pgm', block_definition_id: 'builtin.videoenc', name: 'Enc program', properties: { encoder_preference: encoderPreference, bitrate: 3000 }, position: { x: 700, y: 500 } },
+    { id: 'whep_pgm', block_definition_id: 'builtin.whep_output', name: 'Program WHEP', properties: { num_audio_tracks: 0, endpoint_id: endpointOf(req.groupId, 'pgm') }, position: { x: 950, y: 500 } },
     { id: 'enc_air', block_definition_id: 'builtin.videoenc', name: 'Enc air', properties: { bitrate: 10000, encoder_preference: encoderPreference, keyframe_interval: 50, quality_preset: 'medium', rate_control: 'cbr' }, position: { x: 700, y: 420 } },
     { id: 'srt_air', block_definition_id: 'builtin.mpegtssrt_output', name: 'SRT out', properties: { latency: 200, num_audio_tracks: 0, num_video_tracks: 1, srt_uri: req.srtUri }, position: { x: 950, y: 420 } },
   );
@@ -72,6 +74,9 @@ export function buildReplayFlow(req: PlaybackRequest, tamsHost: string, encoderP
     { from: `${MIXER_BLOCK}:pgm_out`, to: 'q_air:sink' },
     { from: 'q_air:src', to: 'enc_air:video_in' },
     { from: 'enc_air:encoded_out', to: 'srt_air:video_in' },
+    // The same program picture for the browser, from its own lower-bitrate encoder: the SRT encoder is untouched.
+    { from: `${MIXER_BLOCK}:pgm_out`, to: 'enc_pgm:video_in' },
+    { from: 'enc_pgm:encoded_out', to: 'whep_pgm:video_in' },
   );
   const elements = [{ id: 'q_air', element_type: 'queue', properties: { leaky: 'downstream', 'max-size-buffers': 0, 'max-size-bytes': 0, 'max-size-time': 1_000_000_000 }, position: [560, 420] }];
   return {

@@ -6,6 +6,8 @@ import { taiNs } from './types.js';
  *
  * - A mark is a moment on a group's timeline. `t` is on the group's axis (the same axis as
  *   Strom's replay API), in nanoseconds as a decimal string.
+ * - A clip belongs to a group and has a server-given `number` and a list of `tags`. It has no speed:
+ *   a single clip plays at the speed the caller sends, and a playlist entry keeps its own.
  * - A clip is a range on the group's axis (`inT`/`outT`, the same axis as Strom's replay API) with a
  *   default camera, `streamId`. Strom keeps one sync offset per camera and applies it to every player
  *   that shows it, so a clip needs no offset of its own and stays in sync if the offsets are trimmed.
@@ -17,7 +19,9 @@ import { taiNs } from './types.js';
 
 const name = z.string().min(1).max(200);
 const groupId = z.string().min(1).max(100);
-const tag = z.string().min(1).max(50).nullable();
+const tagName = z.string().trim().min(1).max(50);
+/** A clip's tags: a list of words, each once. */
+const tagList = z.array(tagName).max(50).transform((l) => [...new Set(l)]);
 /** Wall-clock time of the moment (milliseconds since the epoch, UTC), kept for showing it to a person. The exact time is `t` or `inT`. */
 const utcMs = z.number().finite().nonnegative().optional();
 /** A caller may choose the id (`<kind>:<letters, digits, dashes>`) so it can show the item before the server answers. A taken id is a conflict. */
@@ -26,10 +30,8 @@ const idFor = (kind: string) => z.string().regex(new RegExp(`^${kind}:[A-Za-z0-9
 export const markInput = z.object({
   id: idFor('mark'),
   groupId,
-  name,
   t: taiNs,
   utcMs,
-  tag: tag.default(null),
 });
 
 export const clipInput = z.object({
@@ -43,10 +45,7 @@ export const clipInput = z.object({
   outT: taiNs,
   /** Wall-clock time of the in point, for display. */
   utcMs,
-  /** Fraction of real time, 0 < speed <= 1. */
-  speed: z.number().gt(0).lte(1).default(1),
-  tag: tag.default(null),
-  starred: z.boolean().default(false),
+  tags: tagList.default([]),
   notes: z.string().max(2000).optional(),
 });
 
@@ -68,12 +67,17 @@ export const playlistInput = z.object({
 /** A patch may carry the `rev` it was read at; a mismatch is a conflict instead of a silent overwrite. */
 const withRev = { rev: z.string().optional() };
 export const markPatch = markInput.omit({ id: true }).partial().extend(withRev);
-export const clipPatch = clipInput.omit({ id: true }).partial().extend(withRev);
+/** A clip's number is per group, so its group can't change. */
+export const clipPatch = clipInput.omit({ id: true, groupId: true }).partial().extend(withRev);
 export const playlistPatch = playlistInput.omit({ id: true }).partial().extend(withRev);
 
 const stored = { id: z.string(), rev: z.string(), createdAt: z.string(), updatedAt: z.string() };
 export const markSchema = markInput.omit({ id: true }).extend(stored);
-export const clipSchema = clipInput.omit({ id: true }).extend(stored);
+/** `number` is given by the server: a running number per group, never reused. */
+export const clipSchema = clipInput.omit({ id: true }).extend({ number: z.number().int().positive(), ...stored });
+
+export const tagNameSchema = tagName;
+export const tagSchema = z.object({ name: tagName, count: z.number().int().nonnegative() });
 export const playlistSchema = playlistInput.omit({ id: true }).extend(stored);
 
 export type Mark = z.infer<typeof markSchema>;
@@ -81,6 +85,10 @@ export type Clip = z.infer<typeof clipSchema>;
 export type Playlist = z.infer<typeof playlistSchema>;
 
 export type LibraryKind = 'mark' | 'clip' | 'playlist';
+
+/** Bookkeeping documents of a group: the clip counter and the stored tag list. */
+export const counterId = (groupId: string) => `counter:clip:${groupId}`;
+export const tagListId = (groupId: string) => `taglist:${groupId}`;
 
 /** The stored CouchDB document: the API shape without `id`/`rev`, plus CouchDB's own fields. */
 export type LibraryDoc<T> = Omit<T, 'id' | 'rev'> & {

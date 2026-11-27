@@ -16,6 +16,18 @@ export interface PlaybackRequest {
 /** The replay group of a studio group's media players. Unique per group, so two replays never share a timeline. */
 export const replayGroupOf = (groupId: string) => `studio-${groupId}`;
 
+/** The two clip players of a replay flow (ADR-0002): they play clips and playlists, each in a replay group of its own. */
+export type ClipPlayer = 'a' | 'b';
+export const CLIP_PLAYERS: ClipPlayer[] = ['a', 'b'];
+export const clipBlockOf = (p: ClipPlayer) => `clip${p.toUpperCase()}`;
+export const clipGroupOf = (groupId: string, p: ClipPlayer) => `${replayGroupOf(groupId)}-${p}`;
+/** A camera's block id: `cam1`, `cam2`, ... The clip players are not cameras. */
+export const isCameraBlock = (id: string | undefined) => /^cam\d+$/.test(id ?? '');
+/** The mixer input of a clip player: after the N cameras, A then B. */
+export const clipInputOf = (cameras: number, p: ClipPlayer) => cameras + CLIP_PLAYERS.indexOf(p);
+/** The most cameras a replay can have: the vision mixer has 16 inputs and the two clip players take two. */
+export const MAX_CAMERAS = 14;
+
 /** The id of the mixer block, which the preview and take calls address. */
 export const MIXER_BLOCK = 'vm';
 
@@ -30,8 +42,9 @@ export const PREVIEW_BLOCK = 'pvw';
 export const endpointOf = (groupId: string, kind: 'pgm' | 'pvw' | `cam${number}`) => `or-${groupId.replace(/[^a-z0-9]/gi, '').slice(-10)}-${kind}`;
 
 /**
- * The Strom flow that replays one group: a media player per stream, each with its own WHEP video; a mixer with a
- * preview and a program bus; the program goes out over SRT and as WHEP video for the browser. `encoderPreference` is passed to every encoder.
+ * The Strom flow that replays one group: a media player per stream, each with its own WHEP video; two clip players
+ * (A and B) for clips and playlists; a mixer with a preview and a program bus, which takes the cameras and the two clip
+ * players; the program goes out over SRT and as WHEP video for the browser. `encoderPreference` is passed to every encoder.
  */
 export type EncoderPreference = 'auto' | 'hardware' | 'software';
 
@@ -56,11 +69,25 @@ export function buildReplayFlow(req: PlaybackRequest, tamsHost: string, encoderP
     );
     links.push({ from: `cam${i + 1}:video_out`, to: `enc_cam${i + 1}:video_in` }, { from: `enc_cam${i + 1}:encoded_out`, to: `whep_cam${i + 1}:video_in` });
   });
-  const labels = Object.fromEntries(req.members.map((m, i) => [`input_${i}_label`, m.label]));
+  // The clip players. A new group starts paused, and a clip is cued onto it later, so the source here is only a place to start: the first camera.
+  const first = req.members[0]!;
+  const n = req.members.length;
+  CLIP_PLAYERS.forEach((p, k) => {
+    const id = clipBlockOf(p);
+    blocks.push({
+      id,
+      block_definition_id: 'builtin.media_player',
+      name: `Clip ${p.toUpperCase()}`,
+      properties: { mode: 'timeline', group: clipGroupOf(req.groupId, p), source: `tams+https://${tamsHost}/flows/${first.streamId}`, auth_mode: 'osc', output_framerate: '25/1', num_audio_tracks: 0 },
+      position: { x: 100, y: 80 + (n + k) * 160 },
+    });
+    links.push({ from: `${id}:video_out`, to: `${MIXER_BLOCK}:video_in_${clipInputOf(n, p)}` }, { from: `${id}:video_out`, to: `${PREVIEW_BLOCK}:video_in_${clipInputOf(n, p)}` });
+  });
+  const labels = Object.fromEntries([...req.members.map((m) => m.label), ...CLIP_PLAYERS.map((p) => `Clip ${p.toUpperCase()}`)].map((l, i) => [`input_${i}_label`, l]));
   blocks.push(
-    { id: MIXER_BLOCK, block_definition_id: 'builtin.vision_mixer', name: 'Replay mixer', properties: { num_inputs: req.members.length, pgm_framerate: '25/1', pgm_resolution: '1280x720', ...labels }, position: { x: 400, y: 160 } },
+    { id: MIXER_BLOCK, block_definition_id: 'builtin.vision_mixer', name: 'Replay mixer', properties: { num_inputs: n + CLIP_PLAYERS.length, pgm_framerate: '25/1', pgm_resolution: '1280x720', ...labels }, position: { x: 400, y: 160 } },
     // The preview mixer starts on the same source the main mixer previews first (its second input).
-    { id: PREVIEW_BLOCK, block_definition_id: 'builtin.vision_mixer', name: 'Preview mixer', properties: { num_inputs: req.members.length, pgm_framerate: '25/1', pgm_resolution: '1280x720', initial_pgm_input: Math.min(1, req.members.length - 1), ...labels }, position: { x: 400, y: 320 } },
+    { id: PREVIEW_BLOCK, block_definition_id: 'builtin.vision_mixer', name: 'Preview mixer', properties: { num_inputs: n + CLIP_PLAYERS.length, pgm_framerate: '25/1', pgm_resolution: '1280x720', initial_pgm_input: Math.min(1, n - 1), ...labels }, position: { x: 400, y: 320 } },
     { id: 'enc_pvw', block_definition_id: 'builtin.videoenc', name: 'Enc preview', properties: { encoder_preference: encoderPreference, bitrate: 3000 }, position: { x: 700, y: 340 } },
     { id: 'whep_pvw', block_definition_id: 'builtin.whep_output', name: 'Preview WHEP', properties: { num_audio_tracks: 0, endpoint_id: endpointOf(req.groupId, 'pvw') }, position: { x: 950, y: 340 } },
     { id: 'enc_pgm', block_definition_id: 'builtin.videoenc', name: 'Enc program', properties: { encoder_preference: encoderPreference, bitrate: 3000 }, position: { x: 700, y: 500 } },

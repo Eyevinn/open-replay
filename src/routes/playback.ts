@@ -1,7 +1,8 @@
 import type { FastifyInstance } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
-import { buildReplayFlow, endpointOf, MIXER_BLOCK, PREVIEW_BLOCK, replayGroupOf } from '../lib/replay-flow.js';
+import { buildReplayFlow, CLIP_PLAYERS, clipBlockOf, clipInputOf, endpointOf, isCameraBlock, MAX_CAMERAS, MIXER_BLOCK, PREVIEW_BLOCK, replayGroupOf, type ClipPlayer } from '../lib/replay-flow.js';
+import { goLiveWhenReady } from '../lib/replay-live.js';
 import type { StromClient } from '../lib/strom.js';
 import type { Services } from '../services.js';
 
@@ -14,7 +15,7 @@ interface StromBlock {
   name?: string;
   properties?: Record<string, unknown>;
 }
-interface StromFlow {
+export interface StromFlow {
   id: string;
   gst_state?: string;
   blocks?: StromBlock[];
@@ -44,6 +45,10 @@ const playbackSchema = z.discriminatedUnion('running', [
     /** Each source with its own WHEP video, in mixer input order. */
     sources: z.array(z.object({ index: z.number().int(), label: z.string(), path: z.string() })),
     mixer: mixerSchema,
+    /** The clip players this replay has, and the mixer input each is on, so a program or preview index past the cameras can be named. */
+    clipPlayers: z.array(z.object({ player: z.enum(['a', 'b']), index: z.number().int(), label: z.string() })),
+    /** How far behind the live edge `live` parks the cursor, in ms. The studio uses the same value for its own live commands. */
+    liveMarginMs: z.number().int(),
     /** The SRT address the program goes to. */
     srtUri: z.string().nullable(),
     /** True for a replay started before it had source, preview and program video: it has to be started again to be driven here. */
@@ -55,10 +60,10 @@ type Playback = z.infer<typeof playbackSchema>;
 const startBody = z.object({
   name: z.string().min(1).max(200),
   srtUri: z.string().regex(/^srt:\/\/\S+$/, 'An SRT address, such as srt://127.0.0.1:5031?mode=caller'),
-  members: z.array(z.object({ streamId: z.string().min(1), label: z.string().min(1) })).min(1).max(20),
+  members: z.array(z.object({ streamId: z.string().min(1), label: z.string().min(1) })).min(1).max(MAX_CAMERAS),
 });
 
-async function listFlows(strom: StromClient): Promise<StromFlow[]> {
+export async function listFlows(strom: StromClient): Promise<StromFlow[]> {
   const r = await strom.request('/api/flows');
   const flows = r.body['flows'] as StromFlow[] | undefined;
   if (!r.ok || !flows) throw new Error(`Strom answered ${r.status}`);
@@ -66,14 +71,14 @@ async function listFlows(strom: StromClient): Promise<StromFlow[]> {
 }
 
 /** A player's replay group is `group` in Strom 0.8, `replay_group` in older versions. */
-const flowOf = (flows: StromFlow[], groupId: string) =>
+export const flowOf = (flows: StromFlow[], groupId: string) =>
   flows.find((f) => f.blocks?.some((b) => b.properties?.['group'] === replayGroupOf(groupId) || b.properties?.['replay_group'] === replayGroupOf(groupId)));
 
 const mixerPath = (flow: StromFlow) => `/api/flows/${flow.id}/blocks/${MIXER_BLOCK}`;
 const previewMixerPath = (flow: StromFlow) => `/api/flows/${flow.id}/blocks/${PREVIEW_BLOCK}`;
 
 /** Make the preview show `source`: a cut on the preview mixer, which has no other job. */
-async function showInPreview(strom: StromClient, flow: StromFlow, source: number | null): Promise<void> {
+export async function showInPreview(strom: StromClient, flow: StromFlow, source: number | null): Promise<void> {
   if (source === null) return;
   const state = await strom.request(`${previewMixerPath(flow)}/state`);
   const current = typeof state.body['program_input'] === 'number' ? state.body['program_input'] : null;
@@ -81,6 +86,12 @@ async function showInPreview(strom: StromClient, flow: StromFlow, source: number
   await strom.request(`${previewMixerPath(flow)}/preview`, { method: 'PUT', json: { source: { input: source } } });
   await strom.request(`${previewMixerPath(flow)}/transition`, { method: 'POST', json: { from_input: current ?? 0, to_input: source, transition_type: 'cut' } });
 }
+
+/** The cameras of a flow, then its clip players: the inputs of its mixers. */
+export const inputCount = (flow: StromFlow) => (flow.blocks ?? []).filter((b) => b.block_definition_id === 'builtin.media_player').length;
+/** The mixer input a clip player is on in this flow, or null when the flow has none (started before clip players existed). */
+export const clipInputIn = (flow: StromFlow, p: ClipPlayer): number | null =>
+  (flow.blocks ?? []).some((b) => b.id === clipBlockOf(p)) ? clipInputOf((flow.blocks ?? []).filter((b) => b.block_definition_id === 'builtin.media_player' && isCameraBlock(b.id)).length, p) : null;
 
 const hasPreviewMixer = (flow: StromFlow) => (flow.blocks ?? []).some((b) => b.id === PREVIEW_BLOCK);
 const num = (v: unknown) => (typeof v === 'number' ? v : null);
@@ -98,11 +109,12 @@ async function mixerState(strom: StromClient, flow: StromFlow): Promise<z.infer<
   return { program, preview: num(pvw.body['program_input']) };
 }
 
-async function describe(strom: StromClient, flow: StromFlow | undefined, groupId: string): Promise<Playback> {
+async function describe(strom: StromClient, flow: StromFlow | undefined, groupId: string, liveMarginMs: number): Promise<Playback> {
   if (!flow) return { running: false };
   const mixer = await mixerState(strom, flow);
   const blocks = flow.blocks ?? [];
-  const players = blocks.filter((b) => b.block_definition_id === 'builtin.media_player');
+  const players = blocks.filter((b) => b.block_definition_id === 'builtin.media_player' && isCameraBlock(b.id));
+  const clipPlayers = CLIP_PLAYERS.filter((p) => blocks.some((b) => b.id === clipBlockOf(p))).map((p) => ({ player: p, index: clipInputOf(players.length, p), label: `Clip ${p.toUpperCase()}` }));
   const hasVideo = (i: number) => blocks.some((b) => b.id === `whep_cam${i + 1}`);
   const sources = players.flatMap((b, i) => (hasVideo(i) ? [{ index: i, label: b.name ?? `Source ${i + 1}`, path: `${STROM_PROXY_PREFIX}/whep/${endpointOf(groupId, `cam${i + 1}`)}` }] : []));
   const hasPreview = blocks.some((b) => b.id === 'whep_pvw');
@@ -118,6 +130,8 @@ async function describe(strom: StromClient, flow: StromFlow | undefined, groupId
     programPath: `${STROM_PROXY_PREFIX}/whep/${endpointOf(groupId, 'pgm')}`,
     sources,
     mixer,
+    clipPlayers,
+    liveMarginMs,
     srtUri: typeof srt === 'string' ? srt : null,
     outdated: players.length > 0 && (sources.length === 0 || !hasPreview || !hasProgram),
   };
@@ -133,7 +147,7 @@ export async function playbackRoutes(app: FastifyInstance, opts: { services: Ser
   const r = app.withTypeProvider<ZodTypeProvider>();
   const params = z.object({ groupId: z.string().min(1) });
   const error = z.object({ error: z.string() });
-  const { strom, tams, oscAccessToken, encoderPreference } = opts.services;
+  const { strom, tams, oscAccessToken, encoderPreference, liveMarginMs = 1500 } = opts.services;
   const notReady = 'Set STROM_URL, TAMS_GATEWAY_URL and OSC_ACCESS_TOKEN to run replays.';
   const failed = (err: unknown) => `Strom could not be reached: ${err instanceof Error ? err.message : String(err)}`;
 
@@ -142,7 +156,7 @@ export async function playbackRoutes(app: FastifyInstance, opts: { services: Ser
   }, async (req, reply) => {
     if (!strom) return reply.code(503).send({ error: notReady });
     try {
-      return await describe(strom, flowOf(await listFlows(strom), req.params.groupId), req.params.groupId);
+      return await describe(strom, flowOf(await listFlows(strom), req.params.groupId), req.params.groupId, liveMarginMs);
     } catch (err) {
       return reply.code(502).send({ error: failed(err) });
     }
@@ -167,7 +181,9 @@ export async function playbackRoutes(app: FastifyInstance, opts: { services: Ser
       await strom.request(`/api/osc/pat/${id}`, { method: 'PUT', json: { pat: oscAccessToken } });
       const started = await strom.request(`/api/flows/${id}/start`, { method: 'POST' });
       if (!started.ok) return reply.code(502).send({ error: `Strom would not start the replay (${started.status}).` });
-      return await describe(strom, flowOf(await listFlows(strom), groupId), groupId);
+      // A new group starts paused at the first recorded segment. Put it on the live edge without waiting for a browser.
+      void goLiveWhenReady(strom, id, replayGroupOf(groupId), { marginMs: liveMarginMs, log: (m) => req.log.info(m) });
+      return await describe(strom, flowOf(await listFlows(strom), groupId), groupId, liveMarginMs);
     } catch (err) {
       return reply.code(502).send({ error: failed(err) });
     }
@@ -199,7 +215,7 @@ export async function playbackRoutes(app: FastifyInstance, opts: { services: Ser
       const flow = flowOf(await listFlows(strom), req.params.groupId);
       if (!flow) return reply.code(404).send({ error: 'This group has no replay running.' });
       if (!hasPreviewMixer(flow)) return reply.code(409).send({ error: 'This replay was started with an older version. Restart it.' });
-      const sources = (flow.blocks ?? []).filter((b) => b.block_definition_id === 'builtin.media_player').length;
+      const sources = inputCount(flow);
       if (req.body.source >= sources) return reply.code(409).send({ error: `There is no source ${req.body.source + 1}.` });
       await showInPreview(strom, flow, req.body.source);
       return await mixerState(strom, flow);

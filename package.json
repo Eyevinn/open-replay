@@ -22,10 +22,12 @@
     "fastify": "^5.9.0",
     "fastify-type-provider-zod": "^4.0.2",
     "nano": "^10.1.4",
+    "ws": "^8.23.0",
     "zod": "^3.24.3"
   },
   "devDependencies": {
     "@types/node": "^22.15.3",
+    "@types/ws": "^8.18.2",
     "tsx": "^4.19.3",
     "typescript": "^5.8.3",
     "vitest": "^4.1.11"

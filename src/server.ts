@@ -10,6 +10,8 @@ import {
 import type { Config } from './config.js';
 import type { Db } from './db/index.js';
 import { healthRoutes } from './routes/health.js';
+import { libraryRoutes } from './routes/library.js';
+import { playlistPlayRoutes } from './routes/playlist-play.js';
 import { playbackRoutes, STROM_PROXY_PREFIX } from './routes/playback.js';
 import { replayRoutes } from './routes/replays.js';
 import { streamRoutes } from './routes/streams.js';
@@ -50,8 +52,10 @@ export async function buildServer(config: Pick<Config, 'apiKey' | 'corsOrigin' |
       });
     }
     await v1.register(replayRoutes, { db });
+    await v1.register(libraryRoutes, { db });
     await v1.register(streamRoutes, { services });
     await v1.register(playbackRoutes, { services });
+    await v1.register(playlistPlayRoutes, { db, services });
     // Strom for the browser: the operator screen's WebSocket and WHEP video go through here, so the key stays on this side.
     if (services.strom) {
       await v1.register(httpProxy, {

@@ -15,6 +15,13 @@ function encoderPreference(v: string | undefined): 'auto' | 'hardware' | 'softwa
   throw new Error(`ENCODER_PREFERENCE must be auto, hardware or software, got "${v}"`);
 }
 
+function liveMargin(v: string | undefined): number {
+  if (v === undefined) return 1500;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0 || n > 10_000) throw new Error(`REPLAY_LIVE_MARGIN_MS must be a whole number of ms from 0 to 10000, got "${v}"`);
+  return n;
+}
+
 export interface Config {
   port: number;
   logLevel: string;
@@ -34,6 +41,8 @@ export interface Config {
   stromAuthToken: string | undefined;
   /** Which encoders replay flows ask Strom for: `auto` (hardware first, then software), `hardware` or `software`. */
   encoderPreference: 'auto' | 'hardware' | 'software';
+  /** How far behind the live edge a replay starts playing, in ms (Strom's `live` command). */
+  liveMarginMs: number;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -61,6 +70,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       stromUrl: optional('STROM_URL')?.replace(/\/+$/, ''),
       stromAuthToken: optional('STROM_AUTH_TOKEN'),
       encoderPreference: encoderPreference(optional('ENCODER_PREFERENCE')),
+      liveMarginMs: liveMargin(optional('REPLAY_LIVE_MARGIN_MS')),
     };
   } finally {
     process.env = prev;

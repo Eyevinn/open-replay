@@ -3,6 +3,7 @@ import type { Db } from '../db/index.js';
 import { buildReplayFlow, endpointOf, replayGroupOf } from '../lib/replay-flow.js';
 import { parseTimerange } from '../lib/streams.js';
 import { StromClient } from '../lib/strom.js';
+import { goLiveWhenReady } from '../lib/replay-live.js';
 import { buildServer } from '../server.js';
 
 const db = { server: { db: { get: async () => ({}) } }, docs: { config: { db: 'test' } } } as unknown as Db;
@@ -22,10 +23,25 @@ describe('buildReplayFlow', () => {
   const flow = buildReplayFlow(req, 'tams.example');
 
   it('has a player per stream, all in the group replay group, reading the store', () => {
-    const players = flow.blocks.filter((b) => b['block_definition_id'] === 'builtin.media_player');
+    const players = flow.blocks.filter((b) => b['block_definition_id'] === 'builtin.media_player' && /^cam\d+$/.test(String(b['id'])));
     expect(players).toHaveLength(2);
     for (const p of players) expect((p['properties'] as Record<string, unknown>)['group']).toBe(replayGroupOf('g-5696da24'));
     expect((players[0]!['properties'] as Record<string, unknown>)['source']).toBe('tams+https://tams.example/flows/abc');
+  });
+  it('adds two clip players, each in a group of its own, after the cameras on both mixers', () => {
+    const byId = (id: string) => flow.blocks.find((b) => b['id'] === id)!;
+    for (const [id, group, input] of [['clipA', 'studio-g-5696da24-a', 2], ['clipB', 'studio-g-5696da24-b', 3]] as const) {
+      const props = byId(id)['properties'] as Record<string, unknown>;
+      expect(props).toMatchObject({ mode: 'timeline', group, auth_mode: 'osc', output_framerate: '25/1', source: 'tams+https://tams.example/flows/abc' });
+      expect(flow.links).toEqual(expect.arrayContaining([{ from: `${id}:video_out`, to: `vm:video_in_${input}` }, { from: `${id}:video_out`, to: `pvw:video_in_${input}` }]));
+    }
+    // Cameras and clip players: both mixers take N + 2 inputs, labelled.
+    for (const m of ['vm', 'pvw']) expect(byId(m)['properties']).toMatchObject({ num_inputs: 4, input_2_label: 'Clip A', input_3_label: 'Clip B' });
+  });
+  it('does not give the clip players a video of their own: the preview shows them', () => {
+    const ids = flow.blocks.map((b) => b['id']);
+    expect(ids).not.toContain('whep_clipA');
+    expect(ids).not.toContain('enc_clipA');
   });
   it('gives every source its own WHEP video and leaves out the multiview', () => {
     const ids = flow.blocks.map((b) => b['id']);
@@ -90,6 +106,7 @@ describe('a replay started before sources had their own video', () => {
       const app = await buildServer(base, db, { strom: new StromClient({ url: 'http://strom.test', key: undefined }) });
       const body = (await app.inject('/api/v1/groups/g-1/playback')).json();
       expect(body.outdated).toBe(true);
+      expect(body.liveMarginMs).toBe(1500);
       expect(body.sources).toEqual([]);
       expect(body.srtUri).toBe('srt://127.0.0.1:5030?mode=caller');
     } finally {
@@ -170,5 +187,57 @@ describe('playback with a Strom', () => {
     const put = (body: unknown) => app.inject({ method: 'PUT', url: '/api/v1/groups/g-1/playback', payload: body as object });
     expect((await put({ name: 'x', srtUri: 'srt://h:1', members: [] })).statusCode).toBe(400);
     expect((await put({ name: 'x', srtUri: 'http://h', members: [{ streamId: 'a', label: 'A' }] })).statusCode).toBe(400);
+  });
+});
+
+describe('goLiveWhenReady', () => {
+  /** A Strom that answers each state request from a script, and records the commands it is sent. */
+  const fakeStrom = (states: { ok: boolean; body: Record<string, unknown> }[]) => {
+    const commands: unknown[] = [];
+    let i = 0;
+    const strom = {
+      request: async (path: string, init?: { json?: unknown }) => {
+        if (path.endsWith('/command')) {
+          commands.push(init?.json);
+          return { ok: true, status: 200, body: {} };
+        }
+        return { status: 200, ...(states[Math.min(i++, states.length - 1)] as object) };
+      },
+    } as unknown as StromClient;
+    return { strom, commands };
+  };
+  const opts = { everyMs: 0, timeoutMs: 1000, marginMs: 800 };
+
+  it('waits for the live edge, then sends live once', async () => {
+    const { strom, commands } = fakeStrom([
+      { ok: false, body: {} },
+      { ok: true, body: { speed: 0 } },
+      { ok: true, body: { speed: 0, live_edge: { frame: 1 } } },
+    ]);
+    expect(await goLiveWhenReady(strom, 'f1', 'studio-g-1', opts)).toBe('sent');
+    expect(commands).toEqual([{ cmd: 'live', margin_ms: 800 }]);
+  });
+  it('reads the live edge and speed from the typed state of the deployed Strom', async () => {
+    const { strom, commands } = fakeStrom([
+      { ok: true, body: { ready: 'warming', range: { start: { t: '1' }, live_edge: null }, motion: { speed: 0 } } },
+      { ok: true, body: { ready: 'ready', range: { start: { t: '1' }, live_edge: { t: '9' } }, motion: { speed: 0, live: false } } },
+    ]);
+    expect(await goLiveWhenReady(strom, 'f1', 'studio-g-1', opts)).toBe('sent');
+    expect(commands).toEqual([{ cmd: 'live', margin_ms: 800 }]);
+  });
+  it('leaves a typed-state group alone that is already moving', async () => {
+    const { strom, commands } = fakeStrom([{ ok: true, body: { range: { live_edge: { t: '9' } }, motion: { speed: 0.56 } } }]);
+    expect(await goLiveWhenReady(strom, 'f1', 'studio-g-1', opts)).toBe('already-moving');
+    expect(commands).toEqual([]);
+  });
+  it('leaves a group alone that is already moving', async () => {
+    const { strom, commands } = fakeStrom([{ ok: true, body: { speed: 1, live_edge: { frame: 1 } } }]);
+    expect(await goLiveWhenReady(strom, 'f1', 'studio-g-1', opts)).toBe('already-moving');
+    expect(commands).toEqual([]);
+  });
+  it('gives up when the group never becomes ready', async () => {
+    const { strom, commands } = fakeStrom([{ ok: false, body: {} }]);
+    expect(await goLiveWhenReady(strom, 'f1', 'studio-g-1', { ...opts, timeoutMs: 30 })).toBe('timeout');
+    expect(commands).toEqual([]);
   });
 });

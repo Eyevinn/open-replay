@@ -10,9 +10,11 @@ export interface Services {
   oscAccessToken?: string;
   /** Encoder preference written into replay flows. */
   encoderPreference?: 'auto' | 'hardware' | 'software';
+  /** How far behind the live edge a started replay plays, in ms. */
+  liveMarginMs?: number;
 }
 
-export function buildServices(config: Pick<Config, 'tamsUrl' | 'tamsServiceId' | 'oscAccessToken' | 'stromUrl' | 'stromAuthToken' | 'encoderPreference'>): Services {
+export function buildServices(config: Pick<Config, 'tamsUrl' | 'tamsServiceId' | 'oscAccessToken' | 'stromUrl' | 'stromAuthToken' | 'encoderPreference' | 'liveMarginMs'>): Services {
   return {
     tams: config.tamsUrl && config.oscAccessToken
       ? new TamsClient({ url: config.tamsUrl, serviceId: config.tamsServiceId, accessToken: config.oscAccessToken })
@@ -20,5 +22,6 @@ export function buildServices(config: Pick<Config, 'tamsUrl' | 'tamsServiceId' |
     strom: config.stromUrl ? new StromClient({ url: config.stromUrl, key: config.stromAuthToken }) : undefined,
     oscAccessToken: config.oscAccessToken,
     encoderPreference: config.encoderPreference,
+    liveMarginMs: config.liveMarginMs,
   };
 }

@@ -26,7 +26,9 @@ pnpm dev                  # http://localhost:3000, OpenAPI UI at /docs
 - `/api/v1/replays`: `GET` list, `POST`, `GET|PATCH|DELETE /:id`. Auth with `X-API-Key` or `Authorization: Bearer`. The earlier single-angle form; `clips` below replaces it.
 - The library, each with `GET` list (filter by `groupId`; clips also by `streamId`), `POST`, `GET|PATCH|DELETE /:id`:
   - `/api/v1/marks`: a moment on a group's axis (`t`, nanoseconds as a decimal string).
-  - `/api/v1/clips`: a range on the group's axis (`inT`, `outT`) with a default camera (`streamId`), a speed, a tag, a star. Strom applies each camera's sync offset itself, so a clip carries none.
+  - `/api/v1/clips`: a range on the group's axis (`inT`, `outT`) with a default camera (`streamId`), a `number` the server gives (per group, never reused) and a list of `tags`. A clip has no speed: a single clip is played at the `speed` the caller sends (default 1), and a playlist entry keeps its own. Strom applies each camera's sync offset itself, so a clip carries none.
+  - `GET|POST /api/v1/groups/:groupId/tags`, `PATCH|DELETE .../tags/:name`: a group's tag list with the number of clips for each (a tag can have none). Rename and delete act on every clip of the group; renaming to a name that exists is `409`.
+  - Records saved in the first shape (clip `speed`, `starred`, `tag`; mark `name`, `tag`) are migrated at start.
   - `/api/v1/playlists`: an ordered `items` list of `{ clipId, speed }`. Every clip must exist. Deleting a clip removes it from the playlists that held it.
   - A playlist also has an `endAction`: `freeze` (default, hold the last frame), `loop` or `live`.
   - A `PATCH` may carry the `rev` it was read at; if the document has changed since, the answer is `409` instead of a silent overwrite.

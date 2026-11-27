@@ -5,7 +5,7 @@ import type { DocumentScope, MangoSelector } from 'nano';
 import { z } from 'zod';
 import { isConflict, isNotFound, type Db } from '../db/index.js';
 import {
-  clipInput, clipPatch, clipSchema, markInput, markPatch, markSchema,
+  clipInput, clipPatch, clipSchema, counterId, tagListId, tagNameSchema, tagSchema, markInput, markPatch, markSchema,
   playlistInput, playlistPatch, playlistSchema,
   type LibraryDoc, type LibraryKind,
 } from '../db/library-types.js';
@@ -33,6 +33,8 @@ interface Resource {
   /** Query filters that map to document fields, for example `groupId`. */
   filters: string[];
   check?: Check;
+  /** Adds server-given fields to a new document, before it is stored. */
+  beforeInsert?: (body: Record<string, unknown>) => Promise<Record<string, unknown>>;
   /** Runs after a delete, to keep other documents consistent. */
   afterDelete?: (id: string) => Promise<void>;
 }
@@ -73,11 +75,143 @@ export async function libraryRoutes(app: FastifyInstance, opts: { db: Db }) {
     }
   };
 
+  /** The next clip number of a group. A counter document per group; a 409 means another create got in first, so retry. A delete never lowers it. */
+  const nextClipNumber = async (groupId: string): Promise<number> => {
+    for (let attempt = 0; attempt < 50; attempt++) {
+      let cur: Doc | undefined;
+      try {
+        cur = await docs.get(counterId(groupId));
+      } catch (err) {
+        if (!isNotFound(err)) throw err;
+      }
+      const n = (cur ? Number(cur['n']) : 0) + 1;
+      try {
+        await docs.insert({ ...(cur ?? { _id: counterId(groupId) }), n, type: 'counter' } as unknown as Doc);
+        return n;
+      } catch (err) {
+        if (!isConflict(err)) throw err;
+      }
+    }
+    throw new Error('could not number the clip, too many concurrent creates');
+  };
+
   const resources: Resource[] = [
     { kind: 'mark', path: '/marks', input: markInput, patch: markPatch, output: markSchema, filters: ['groupId'] },
-    { kind: 'clip', path: '/clips', input: clipInput, patch: clipPatch, output: clipSchema, filters: ['groupId', 'streamId'], check: rangeCheck, afterDelete: dropClipFromPlaylists },
+    { kind: 'clip', path: '/clips', input: clipInput, patch: clipPatch, output: clipSchema, filters: ['groupId', 'streamId'], check: rangeCheck,
+      beforeInsert: async (b) => ({ ...b, number: await nextClipNumber(b['groupId'] as string) }), afterDelete: dropClipFromPlaylists },
     { kind: 'playlist', path: '/playlists', input: playlistInput, patch: playlistPatch, output: playlistSchema, filters: ['groupId'], check: itemsCheck },
   ];
+
+  // ---- tags of a group ----
+
+  const tagParams = z.object({ groupId: z.string().min(1).max(100), name: z.string().min(1).max(50) });
+  const groupParams = z.object({ groupId: z.string().min(1).max(100) });
+
+  const clipsOf = async (groupId: string): Promise<Doc[]> =>
+    (await docs.find({ selector: { type: 'clip', groupId, createdAt: { $gt: null } }, limit: 100000 })).docs;
+  const storedTags = async (groupId: string): Promise<{ doc?: Doc; names: string[] }> => {
+    try {
+      const doc = await docs.get(tagListId(groupId));
+      return { doc, names: (doc['names'] as string[]) ?? [] };
+    } catch (err) {
+      if (isNotFound(err)) return { names: [] };
+      throw err;
+    }
+  };
+  const saveTags = async (groupId: string, cur: Doc | undefined, names: string[]) =>
+    docs.insert({ ...(cur ?? { _id: tagListId(groupId) }), names, type: 'taglist' } as unknown as Doc);
+  /** The stored names plus any tag a clip carries, with the number of clips for each. Counted here, not by the database. */
+  const tagsOf = async (groupId: string) => {
+    const counts = new Map<string, number>();
+    for (const n of (await storedTags(groupId)).names) counts.set(n, 0);
+    for (const c of await clipsOf(groupId)) {
+      for (const t of new Set((c['tags'] as string[] | undefined) ?? [])) counts.set(t, (counts.get(t) ?? 0) + 1);
+    }
+    return [...counts].map(([name, count]) => ({ name, count })).sort((a, b) => a.name.localeCompare(b.name));
+  };
+  /** Rewrites the tags of every clip that carries `from`: to `to`, or just removed when `to` is null. */
+  const retag = (tags: string[], from: string, to: string | null) =>
+    [...new Set(tags.flatMap((t) => (t === from ? (to === null ? [] : [to]) : [t])))];
+  const retagClips = async (groupId: string, from: string, to: string | null) => {
+    for (const listed of await clipsOf(groupId)) {
+      let c: Doc = listed;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const tags = (c['tags'] as string[] | undefined) ?? [];
+        if (!tags.includes(from)) break;
+        try {
+          await docs.insert({ ...c, tags: retag(tags, from, to), updatedAt: new Date().toISOString() });
+          break;
+        } catch (err) {
+          if (!isConflict(err) || attempt === 4) throw err;
+          c = await docs.get(c._id); // edited meanwhile: work from the newer copy
+        }
+      }
+    }
+  };
+
+  r.get('/groups/:groupId/tags', {
+    schema: { tags: ['library'], params: groupParams, response: { 200: z.array(tagSchema) } },
+  }, async (req) => tagsOf(req.params.groupId));
+
+  r.post('/groups/:groupId/tags', {
+    schema: { tags: ['library'], params: groupParams, body: z.object({ name: tagNameSchema }), response: { 201: tagSchema, 409: error } },
+  }, async (req, reply) => {
+    const { groupId } = req.params;
+    const { name } = req.body;
+    if ((await tagsOf(groupId)).some((t) => t.name === name)) return reply.code(409).send({ error: 'that tag exists' });
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const { doc, names } = await storedTags(groupId);
+      try {
+        await saveTags(groupId, doc, [...names, name]);
+        return reply.code(201).send({ name, count: 0 });
+      } catch (err) {
+        if (!isConflict(err)) throw err;
+      }
+    }
+    return reply.code(409).send({ error: 'conflict, retry' });
+  });
+
+  r.patch('/groups/:groupId/tags/:name', {
+    schema: { tags: ['library'], params: tagParams, body: z.object({ name: tagNameSchema }), response: { 200: tagSchema, 404: error, 409: error } },
+  }, async (req, reply) => {
+    const { groupId, name: from } = req.params;
+    const to = req.body.name;
+    const all = await tagsOf(groupId);
+    const cur = all.find((t) => t.name === from);
+    if (!cur) return reply.code(404).send({ error: 'no such tag' });
+    if (to === from) return cur;
+    if (all.some((t) => t.name === to)) return reply.code(409).send({ error: 'a tag with that name exists' });
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const { doc, names } = await storedTags(groupId);
+      try {
+        await saveTags(groupId, doc, names.map((n) => (n === from ? to : n)));
+        break;
+      } catch (err) {
+        if (!isConflict(err) || attempt === 4) throw err;
+      }
+    }
+    await retagClips(groupId, from, to);
+    return { name: to, count: cur.count };
+  });
+
+  r.delete('/groups/:groupId/tags/:name', {
+    schema: { tags: ['library'], params: tagParams, response: { 204: z.null(), 404: error, 409: error } },
+  }, async (req, reply) => {
+    const { groupId, name } = req.params;
+    if (!(await tagsOf(groupId)).some((t) => t.name === name)) return reply.code(404).send({ error: 'no such tag' });
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const { doc, names } = await storedTags(groupId);
+      if (!doc) break;
+      try {
+        await saveTags(groupId, doc, names.filter((n) => n !== name));
+        break;
+      } catch (err) {
+        if (!isConflict(err) || attempt === 4) throw err;
+      }
+    }
+    await retagClips(groupId, name, null);
+    return reply.code(204).send(null);
+  });
 
   const bad = (reply: FastifyReply, message: string) => reply.code(400).send({ error: message });
 
@@ -109,7 +243,8 @@ export async function libraryRoutes(app: FastifyInstance, opts: { db: Db }) {
       const problem = await res.check?.(body);
       if (problem) return bad(reply, problem);
       const now = new Date().toISOString();
-      const doc = { ...body, _id: id ?? `${res.kind}:${randomUUID()}`, type: res.kind, createdAt: now, updatedAt: now } as Doc;
+      const full = (await res.beforeInsert?.(body)) ?? body;
+      const doc = { ...full, _id: id ?? `${res.kind}:${randomUUID()}`, type: res.kind, createdAt: now, updatedAt: now } as Doc;
       try {
         const saved = await docs.insert(doc);
         return reply.code(201).send(toApi({ ...doc, _rev: saved.rev }));

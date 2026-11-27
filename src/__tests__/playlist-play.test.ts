@@ -141,6 +141,18 @@ describe('cueing one clip', () => {
     expect(mock.commands[0]).toMatchObject({ cmd: 'cue', source: 'tams+https://gw.test/flows/cam-1', in: { t: sec(T0) }, out: { t: sec(T0 + 4) } });
   });
 
+  it('takes the speed from the request, 1 by default, and not from the clip', async () => {
+    const { a } = await library();
+    await app.inject({ method: 'PUT', url: clipUrl(), payload: { clipId: a, play: true } });
+        expect(mock.commands[1]).toMatchObject({ cmd: 'play', speed: 1 }); // Strom's cue takes no speed; play carries it
+    mock.commands.length = 0;
+    await app.inject({ method: 'PUT', url: clipUrl(), payload: { clipId: a, play: true, speed: 0.25 } });
+        expect(mock.commands[1]).toMatchObject({ cmd: 'play', speed: 0.25 });
+    for (const speed of [0, 1.5, -1]) {
+      expect((await app.inject({ method: 'PUT', url: clipUrl(), payload: { clipId: a, speed } })).statusCode).toBe(400);
+    }
+  });
+
   it('plays from another camera at the same range when asked to check an angle', async () => {
     const { a } = await library();
     const res = await app.inject({ method: 'PUT', url: clipUrl(), payload: { clipId: a, streamId: 'cam-3', play: true } });

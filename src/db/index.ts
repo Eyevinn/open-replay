@@ -1,6 +1,7 @@
 import nano from 'nano';
 import type { DocumentScope, ServerScope } from 'nano';
 import type { Config } from '../config.js';
+import { migrateLibrary } from './migrate-library.js';
 import type { ReplayDoc } from './types.js';
 
 export interface Db {
@@ -25,6 +26,7 @@ export async function initDb(db: Db, name: string): Promise<void> {
     name: 'type-createdAt',
     ddoc: 'indexes',
   });
+  await migrateLibrary(db.docs);
 }
 
 export async function pingDb(db: Db): Promise<boolean> {

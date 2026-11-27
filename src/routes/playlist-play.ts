@@ -163,7 +163,9 @@ export async function playlistPlayRoutes(app: FastifyInstance, opts: { db: Db; s
         clipId: z.string().min(1),
         /** Another camera of the group at the clip's range ("check another angle"). The clip's own camera when left out. */
         streamId: z.string().min(1).optional(),
-        /** Play at the clip's speed at once. Otherwise it waits on its first frame. */
+        /** The speed to play at, a fraction of real time (the fader's). A clip has none of its own. */
+        speed: z.number().gt(0).lte(1).default(1),
+        /** Play at that speed at once. Otherwise it waits on its first frame. */
         play: z.boolean().default(false),
         /** Show the clip player in preview, so Take sends it to air. */
         preview: z.boolean().default(true),
@@ -181,7 +183,7 @@ export async function playlistPlayRoutes(app: FastifyInstance, opts: { db: Db; s
     if ('error' in found) return reply.code(found.status).send({ error: found.error });
 
     const streamId = req.body.streamId ?? String(clip['streamId']);
-    const speed = typeof clip['speed'] === 'number' ? clip['speed'] : 1;
+    const { speed } = req.body;
     const link = new StromReplayLink(strom, found.flowId, found.group);
     try {
       await link.cue({ source: sourceOf(streamId), in: String(clip['inT']), out: String(clip['outT']), speed, end_action: 'freeze', client_ref: `clip-${req.body.clipId}` });

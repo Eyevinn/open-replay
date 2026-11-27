@@ -69,7 +69,7 @@ async function library() {
     (await post('/clips', { groupId: 'g1', name, streamId, inT: sec(T0 + from), outT: sec(T0 + from + len) })).json().id as string;
   const a = await clip('A', 'cam-1', 0, 4);
   const b = await clip('B', 'cam-2', 10, 6);
-  const pl = (await post('/playlists', { name: 'Highlights', items: [{ clipId: a }, { clipId: b, speed: 0.5 }] })).json();
+  const pl = (await post('/playlists', { groupId: 'g1', name: 'Highlights', items: [{ clipId: a }, { clipId: b, speed: 0.5 }] })).json();
   return { a, b, playlist: pl.id as string };
 }
 
@@ -93,12 +93,40 @@ describe('playing a playlist', () => {
     expect(cues[1]).toMatchObject({ in: { t: sec(T0 + 10) }, out: { t: sec(T0 + 16) }, speed: 0.5 });
   });
 
+  it('plays an entry from its own camera, and from the clip\'s camera when it names none; speed is the entry\'s, 1 by default', async () => {
+    const { a, b } = await library();
+    const pl = (await post('/playlists', { groupId: 'g1', name: 'Angles', items: [{ clipId: a, streamId: 'cam-2' }, { clipId: b, streamId: 'cam-1', speed: 0.25 }, { clipId: a }] })).json().id;
+    await app.inject({ method: 'PUT', url: url(''), payload: { playlistId: pl } });
+    await until(async () => (await app.inject(url(''))).json().state === 'finished');
+    const cues = mock.commands.filter((c) => c['cmd'] === 'cue' || c['cmd'] === 'cue_next');
+    expect(cues.map((c) => c['source'])).toEqual(['tams+https://gw.test/flows/cam-2', 'tams+https://gw.test/flows/cam-1', 'tams+https://gw.test/flows/cam-1']);
+    // Strom's first cue takes no speed (play carries it); the queued items do.
+    expect(cues.filter((c) => c['cmd'] === 'cue_next').map((c) => c['speed'])).toEqual([0.25, 1]);
+  });
+
+  it('adds secondsAfter to the last entry\'s out only, 0 by default, and refuses more than 10', async () => {
+    const { playlist } = await library();
+    const run = async (payload: object) => {
+      mock.commands.length = 0;
+      const res = await app.inject({ method: 'PUT', url: url(''), payload: { playlistId: playlist, ...payload } });
+      if (res.statusCode === 200) await until(async () => (await app.inject(url(''))).json().state === 'finished');
+      return res;
+    };
+    await run({ secondsAfter: 2 });
+    const cues = mock.commands.filter((c) => c['cmd'] === 'cue' || c['cmd'] === 'cue_next');
+    expect(cues[0]).toMatchObject({ out: { t: sec(T0 + 4) } });
+    expect(cues[1]).toMatchObject({ in: { t: sec(T0 + 10) }, out: { t: sec(T0 + 18) } });
+    await run({});
+    expect(mock.commands.filter((c) => c['cmd'] === 'cue_next')[0]).toMatchObject({ out: { t: sec(T0 + 16) } });
+    for (const secondsAfter of [-1, 10.5]) expect((await run({ secondsAfter })).statusCode).toBe(400);
+  });
+
   it('leaves out a clip that is gone, and says which', async () => {
     const { a } = await library();
     // A playlist that still names a clip that no longer exists: the cleanup after a delete can lose a race, so the runner must cope.
     const now = new Date().toISOString();
     await (db.docs as unknown as { insert: (d: object) => Promise<unknown> }).insert({
-      _id: 'playlist:ghost', type: 'playlist', name: 'Ghost', endAction: 'freeze', createdAt: now, updatedAt: now,
+      _id: 'playlist:ghost', type: 'playlist', groupId: 'g1', autoPlay: false, name: 'Ghost', endAction: 'freeze', createdAt: now, updatedAt: now,
       items: [{ clipId: 'clip:gone', speed: 1 }, { clipId: a, speed: 1 }],
     });
     const res = await app.inject({ method: 'PUT', url: url(''), payload: { playlistId: 'playlist:ghost' } });
@@ -119,7 +147,7 @@ describe('playing a playlist', () => {
 
   it('answers 404 for a playlist that does not exist and 409 for one with nothing to play', async () => {
     expect((await app.inject({ method: 'PUT', url: url(''), payload: { playlistId: 'playlist:nope' } })).statusCode).toBe(404);
-    const empty = (await post('/playlists', { name: 'Empty' })).json().id;
+    const empty = (await post('/playlists', { groupId: 'g1', name: 'Empty' })).json().id;
     expect((await app.inject({ method: 'PUT', url: url(''), payload: { playlistId: empty } })).statusCode).toBe(409);
   });
 
@@ -151,6 +179,16 @@ describe('cueing one clip', () => {
     for (const speed of [0, 1.5, -1]) {
       expect((await app.inject({ method: 'PUT', url: clipUrl(), payload: { clipId: a, speed } })).statusCode).toBe(400);
     }
+  });
+
+  it('adds secondsAfter to the clip\'s out, 0 by default', async () => {
+    const { a } = await library();
+    await app.inject({ method: 'PUT', url: clipUrl(), payload: { clipId: a, secondsAfter: 3 } });
+    expect(mock.commands[0]).toMatchObject({ out: { t: sec(T0 + 7) } });
+    mock.commands.length = 0;
+    await app.inject({ method: 'PUT', url: clipUrl(), payload: { clipId: a } });
+    expect(mock.commands[0]).toMatchObject({ out: { t: sec(T0 + 4) } });
+    for (const secondsAfter of [-1, 11]) expect((await app.inject({ method: 'PUT', url: clipUrl(), payload: { clipId: a, secondsAfter } })).statusCode).toBe(400);
   });
 
   it('plays from another camera at the same range when asked to check an angle', async () => {

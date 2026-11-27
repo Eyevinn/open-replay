@@ -12,7 +12,8 @@ import { taiNs } from './types.js';
  *   default camera, `streamId`. Strom keeps one sync offset per camera and applies it to every player
  *   that shows it, so a clip needs no offset of its own and stays in sync if the offsets are trimmed.
  *   Another camera can be cued at the same range.
- * - A playlist is an ordered list of clips with a speed per item.
+ * - A playlist belongs to a group and is an ordered list of entries. An entry names a clip, may name another
+ *   camera, and has its own speed and four audio-track switches (stored only: the replay flow has no audio yet).
  *
  * Nothing here copies media. All three point into the recording.
  */
@@ -49,16 +50,25 @@ export const clipInput = z.object({
   notes: z.string().max(2000).optional(),
 });
 
+/** The four audio-track switches of an entry, in track order. New entries have Tracks 1 and 2 on. */
+export const audioTracks = z.tuple([z.boolean(), z.boolean(), z.boolean(), z.boolean()]);
+export const defaultAudioTracks: [boolean, boolean, boolean, boolean] = [true, true, false, false];
+
 export const playlistItem = z.object({
   clipId: z.string().min(1),
+  /** The camera to play the clip from. The clip's own camera when left out. */
+  streamId: z.string().min(1).max(100).optional(),
+  /** A fraction of real time. Its own: not taken from the clip or the fader. */
   speed: z.number().gt(0).lte(1).default(1),
+  audioTracks: audioTracks.default(defaultAudioTracks),
 });
 
 export const playlistInput = z.object({
   id: idFor('playlist'),
   name,
-  /** Set when the playlist belongs to one group's session; otherwise it is shared. */
-  groupId: groupId.optional(),
+  groupId,
+  /** Start playing when the playlist is loaded. Stored: the Studio acts on it. */
+  autoPlay: z.boolean().default(false),
   items: z.array(playlistItem).max(500).default([]),
   /** What happens after the last item: hold the last frame, play the list again, or go live. */
   endAction: z.enum(['freeze', 'loop', 'live']).default('freeze'),
@@ -69,7 +79,8 @@ const withRev = { rev: z.string().optional() };
 export const markPatch = markInput.omit({ id: true }).partial().extend(withRev);
 /** A clip's number is per group, so its group can't change. */
 export const clipPatch = clipInput.omit({ id: true, groupId: true }).partial().extend(withRev);
-export const playlistPatch = playlistInput.omit({ id: true }).partial().extend(withRev);
+/** A playlist's group can't change. */
+export const playlistPatch = playlistInput.omit({ id: true, groupId: true }).partial().extend(withRev);
 
 const stored = { id: z.string(), rev: z.string(), createdAt: z.string(), updatedAt: z.string() };
 export const markSchema = markInput.omit({ id: true }).extend(stored);
@@ -82,6 +93,8 @@ export const playlistSchema = playlistInput.omit({ id: true }).extend(stored);
 
 export type Mark = z.infer<typeof markSchema>;
 export type Clip = z.infer<typeof clipSchema>;
+export const playlistCopyInput = z.object({ name });
+
 export type Playlist = z.infer<typeof playlistSchema>;
 
 export type LibraryKind = 'mark' | 'clip' | 'playlist';

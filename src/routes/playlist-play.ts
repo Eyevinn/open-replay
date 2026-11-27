@@ -34,6 +34,11 @@ interface Entry {
   skipped: string[];
 }
 
+/** 0 to 10 s added after an out point. */
+const secondsAfter = z.number().min(0).max(10).default(0);
+/** `outT` (ns, decimal string) plus `seconds`, in BigInt so no precision is lost. */
+const later = (outT: string, seconds: number) => (BigInt(outT) + BigInt(Math.round(seconds * 1e9))).toString();
+
 type Found = { flow: StromFlow; flowId: string; group: string; input: number } | { status: 409 | 502; error: string };
 
 /**
@@ -104,6 +109,8 @@ export async function playlistPlayRoutes(app: FastifyInstance, opts: { db: Db; s
         playlistId: z.string().min(1),
         /** Show the clip player in preview, so Take sends it to air. */
         preview: z.boolean().default(true),
+        /** Seconds added after the last entry's out point, so the player holds on its last frame a while longer. */
+        secondsAfter,
       }),
       response: { 200: statusSchema, 404: error, 409: error, 502: error, 503: error },
     },
@@ -121,15 +128,18 @@ export async function playlistPlayRoutes(app: FastifyInstance, opts: { db: Db; s
     // The clips in order. One that was deleted since is left out, and the answer says so.
     const skipped: string[] = [];
     const items: RunnerItem[] = [];
-    for (const it of (playlist['items'] as { clipId: string; speed: number }[]) ?? []) {
+    for (const it of (playlist['items'] as { clipId: string; streamId?: string; speed?: number }[]) ?? []) {
       const clip = await getDoc(it.clipId, 'clip');
       if (!clip) {
         skipped.push(it.clipId);
         continue;
       }
-      items.push({ clipId: it.clipId, name: String(clip['name']), source: sourceOf(String(clip['streamId'])), inT: String(clip['inT']), outT: String(clip['outT']), speed: it.speed });
+      items.push({ clipId: it.clipId, name: String(clip['name']), source: sourceOf(it.streamId ?? String(clip['streamId'])), inT: String(clip['inT']), outT: String(clip['outT']), speed: it.speed ?? 1 });
     }
     if (items.length === 0) return reply.code(409).send({ error: 'The playlist has no clips to play.' });
+    // Seconds after: the last entry's out is later, so the player holds on the clip's Out and goes on.
+    const last = items[items.length - 1]!;
+    last.outT = later(last.outT, req.body.secondsAfter);
 
     const runner = new PlaylistRunner(new StromReplayLink(strom, found.flowId, found.group), items, { endAction: (playlist['endAction'] as EndAction | undefined) ?? 'freeze' });
     try {
@@ -169,6 +179,8 @@ export async function playlistPlayRoutes(app: FastifyInstance, opts: { db: Db; s
         play: z.boolean().default(false),
         /** Show the clip player in preview, so Take sends it to air. */
         preview: z.boolean().default(true),
+        /** Seconds added after the clip's out point. */
+        secondsAfter,
       }),
       response: { 200: clipReply, 404: error, 409: error, 502: error, 503: error },
     },
@@ -186,7 +198,7 @@ export async function playlistPlayRoutes(app: FastifyInstance, opts: { db: Db; s
     const { speed } = req.body;
     const link = new StromReplayLink(strom, found.flowId, found.group);
     try {
-      await link.cue({ source: sourceOf(streamId), in: String(clip['inT']), out: String(clip['outT']), speed, end_action: 'freeze', client_ref: `clip-${req.body.clipId}` });
+      await link.cue({ source: sourceOf(streamId), in: String(clip['inT']), out: later(String(clip['outT']), req.body.secondsAfter), speed, end_action: 'freeze', client_ref: `clip-${req.body.clipId}` });
       if (req.body.play) await link.play(speed);
       if (req.body.preview) await showInPreview(strom, found.flow, found.input);
     } catch (err) {
